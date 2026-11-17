@@ -1,0 +1,6 @@
+/build/
+*.exe
+*.o
+/Ralvioli Plotter.ini
+rp_in.plt
+rp_out.plt
