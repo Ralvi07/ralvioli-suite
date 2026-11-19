@@ -4,7 +4,7 @@ Three native x64 Windows tools for HP-GL plot files.
 
 - **Merger** places, rotates, and combines files within a specified paper width.
 - **Viewer** previews, rotates, and crops files.
-- **Plotter** prepares a print queue, applies paper calibration, and sends HP-GL/2 over USB. The status bar reports Windows USB detection, transfer progress, and errors.
+- **Plotter** prepares a print queue, applies paper calibration, and sends HP-GL/2 over USB. The status bar reports Windows USB detection, transfer progress, and errors. This one is work in progress still and the compatibility for other algotex plotter is not guaranteed
 
 ## Download
 
