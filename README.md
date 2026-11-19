@@ -6,11 +6,16 @@ Three native x64 Windows tools for HP-GL plot files.
 - **Viewer** previews, rotates, and crops files.
 - **Plotter** prepares a print queue, applies paper calibration, and sends HP-GL/2 over USB. The status bar reports Windows USB detection, transfer progress, and errors.
 
-## Build the installer
+## Download
 
-1. Install MSYS2 and run `pacman -S mingw-w64-ucrt-x86_64-toolchain` in its UCRT64 shell.
-2. Install Inno Setup 6.
-3. Run `BUILD_SUITE.bat` from Command Prompt. It builds all three applications and creates `build\Ralvioli Suite Setup.exe`.
+Download **Ralvioli Suite Setup.exe** from the [latest GitHub release](https://github.com/Ralvi07/ralvioli-suite/releases/latest). The Windows x64 installer includes Merger, Viewer, and Plotter.
+
+## Build the installer from source
+
+1. Clone this repository or extract the source ZIP from GitHub.
+2. Install MSYS2. Open its **UCRT64** shell and run `pacman -S --needed mingw-w64-ucrt-x86_64-toolchain`.
+3. Install Inno Setup 6.
+4. Open Command Prompt in the source folder and run `BUILD_SUITE.bat`. The script builds all three apps and packages them as `build\Ralvioli Suite Setup.exe`.
 
 Set `MSYS2_UCRT64_BIN` or `ISCC` first if your tools are in custom locations.
 
@@ -22,4 +27,4 @@ The default backend uses WinUSB for Algotex USB device `135D:F001`. Configure th
 
 Plotter settings are stored in `%LOCALAPPDATA%\Ralvioli Suite\Ralvioli Plotter.ini` by default. A copy of `RalvioliPlotter.ini` named `Ralvioli Plotter.ini` alongside a portable build takes precedence. The sample INI also shows the dry-run and legacy libusbK options.
 
-The status bar tracks host-side USB state and byte transfer. VEGA printing and printer-reported conditions such as paper and ink errors still require verification against a working Algotex USB session.
+The status bar tracks USB detection and byte transfers and displays Windows error codes when available. VEGA printing and printer-reported conditions such as paper and ink errors still require verification against a working Algotex USB session.

@@ -1211,7 +1211,7 @@ void testUsb() {
     a->testUsb = true;
     S.thread = CreateThread(nullptr, 0, printThread, a.get(), 0, nullptr);
     if (!S.thread) {
-        setStatus(L"Could not start the USB test.", true);
+        setStatus(L"Could not start the USB test: " + wide(winErrorText(GetLastError())), true);
         return;
     }
     a.release();

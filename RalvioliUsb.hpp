@@ -31,7 +31,7 @@ inline std::string winErrorText(DWORD e) {
         s.pop_back();
     }
     char num[40];
-    snprintf(num, sizeof(num), " (%lu)", static_cast<unsigned long>(e));
+    snprintf(num, sizeof(num), " (Win32 %lu)", static_cast<unsigned long>(e));
     return (s.empty() ? std::string("error") : s) + num;
 }
 
@@ -193,10 +193,11 @@ struct LibUsbKTransport : Transport {
         }
         DWORD e = GetLastError();
         if (e == ERROR_SEM_TIMEOUT || e == ERROR_TIMEOUT || e == WAIT_TIMEOUT) {
+            err = "libusbK transfer timed out: " + winErrorText(e);
             return 1;
         }
         resetPipe(h, pipe);
-        err = "Sending failed: " + winErrorText(e);
+        err = "libusbK transfer failed: " + winErrorText(e);
         return -1;
     }
 
