@@ -1,2 +1,3 @@
+// Declares the Windows resources compiled into the RalvioliMerger executable.
 1 ICON "RalvioliMerger.ico"
 1 24 "RalvioliApp.manifest"

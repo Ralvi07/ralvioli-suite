@@ -1,2 +1,3 @@
+// Declares the Windows resources compiled into the RalvioliViewer executable.
 1 ICON "RalvioliViewer.ico"
 1 24 "RalvioliApp.manifest"

@@ -1,3 +1,4 @@
+// Manages the Win32 viewer and its per-file preview, rotation, cropping, and export controls.
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

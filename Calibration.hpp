@@ -1,3 +1,4 @@
+// Validates measured print dimensions and computes the correction factors for each plotter axis.
 #pragma once
 #include <cmath>
 // Calibration as done by the old Algotex engine ("Kalibrierung" dialog in AlgotexOcx.ocx):

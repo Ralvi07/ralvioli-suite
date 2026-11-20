@@ -1,3 +1,4 @@
+// Manages the Win32 merger workspace, including piece placement, rotation, paper-width limits, and export.
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

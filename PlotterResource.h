@@ -1,3 +1,4 @@
+// Shares resource identifiers between the Plotter executable and the Windows resource compiler.
 #define IDD_CALIBRATION 101
 #define IDC_FEED_FACTOR 1001
 #define IDC_FEED_EXPECTED 1002

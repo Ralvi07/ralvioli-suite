@@ -1,3 +1,4 @@
+// Plans the bytes sent to the plotter and maps stream positions back to the preview for progress and resume.
 #pragma once
 // Print-stream planning on top of RalvioliCore.hpp (no Windows dependencies).
 // makeStream() reproduces rm::merge() for a single piece line by line, so every output line is
@@ -247,6 +248,7 @@ struct Plan {
     std::vector<char> lineIn;        // per stream line: part of this print
 };
 
+// Translate the requested progress range into a printable slice of the stream.
 inline Plan makePlan(const Stream& s, double fromPct, double toPct) {
     Plan p;
     size_t n = s.lines.size();
@@ -319,6 +321,7 @@ struct DItem {
     int line = -1;
 };
 
+// Associate preview geometry with stream positions for progress display.
 inline std::vector<DItem> buildDrawing(const rm::Piece& piece, const Stream& s) {
     std::vector<DItem> items;
     DItem poly;

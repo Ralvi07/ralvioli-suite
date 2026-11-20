@@ -1,3 +1,4 @@
+// Exercises plot stream planning and the mapping between positions in the stream and the drawing.
 #include <cassert>
 #include <iostream>
 #include <set>

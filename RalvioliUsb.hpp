@@ -1,3 +1,4 @@
+// Defines the plotter transport contract and implements file and legacy libusbK backends.
 #pragma once
 // Transport interface and legacy libusbK and dry-run backends.
 // Include after <windows.h>.

@@ -1,3 +1,4 @@
+// Discovers the plotter's Windows device interface and implements the WinUSB transport.
 #pragma once
 
 #include <setupapi.h>

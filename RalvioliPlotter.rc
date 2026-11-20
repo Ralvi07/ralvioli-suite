@@ -1,3 +1,4 @@
+// Declares the Windows resources compiled into the RalvioliPlotter executable.
 #include <windows.h>
 #include "PlotterResource.h"
 

@@ -1,3 +1,4 @@
+// Implements HP-GL parsing, geometry, unit conversion, and output generation shared by the Suite applications.
 #pragma once
 
 #include <algorithm>
@@ -231,6 +232,7 @@ inline std::string stripEsc(const std::string& raw) {
     return out;
 }
 
+// Split the HP-GL stream into commands before interpreting its geometry.
 inline std::vector<Token> scan(const std::string& data) {
     std::vector<Token> out;
     size_t n = data.size();
@@ -298,6 +300,7 @@ inline std::vector<Token> scan(const std::string& data) {
     return out;
 }
 
+// Interpret commands using the selected input step size and collect the drawing operations.
 inline Parsed parse(const std::string& path, double unitMm = 0.025) {
     const double f = unitMm / 0.025;
     std::string raw = stripEsc(readFile(path));
@@ -496,6 +499,7 @@ inline double mod360(double deg) {
     return std::fmod(std::fmod(deg, 360.0) + 360.0, 360.0);
 }
 
+// Find and remove the printed file-information label from the operation list.
 inline bool removeHeaderText(std::vector<Op>& ops) {
     size_t best = 0;
     size_t second = 0;
@@ -749,6 +753,7 @@ inline std::string pairText(const Pt& p, double dx, double dy, double g = 1.0) {
     return fmt((p.x + dx) * g) + "," + fmt((p.y + dy) * g);
 }
 
+// Serialize the layers using the requested output step size and origin policy.
 inline std::string merge(const std::vector<Piece>& layers, bool toOrigin, double outUnit = 0.025) {
     std::vector<Pt> all;
     for (const Piece& piece : layers) {
@@ -974,6 +979,7 @@ inline bool clipSegment(const Pt& a, const Pt& b, const Box& r, Pt& ca, Pt& cb) 
     return false;
 }
 
+// Clip the drawing operations to the requested crop rectangle.
 inline Piece cropPiece(const Piece& in, const Box& r) {
     Piece out;
     Pt cur = in.start;

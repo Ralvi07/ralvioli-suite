@@ -1,4 +1,5 @@
 @echo off
+rem Compiles the Windows resource files and builds the native Suite applications.
 setlocal
 cd /d "%~dp0" || exit /b 1
 if not defined MSYS2_UCRT64_BIN set "MSYS2_UCRT64_BIN=C:\msys64\ucrt64\bin"
