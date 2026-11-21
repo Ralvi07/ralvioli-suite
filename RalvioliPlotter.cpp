@@ -574,11 +574,103 @@ std::wstring calibrationText(double factor, bool forDisplay = false) {
     return std::wstring(text, result.ptr);
 }
 
+void exportCalibrationSquare(HWND dialog, cal::Factors factors) {
+    wchar_t sizeText[64]{};
+    GetDlgItemTextW(dialog, IDC_TEST_SQUARE_SIZE, sizeText, 64);
+    const auto sideCm = positiveNumber(sizeText);
+    if (!sideCm) {
+        MessageBoxW(dialog, L"Enter a positive side length in centimeters.", L"Test square", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(dialog, IDC_TEST_SQUARE_SIZE));
+        return;
+    }
+
+    const double side = *sideCm * rm::kUnitsPerCm;
+    const double shortSide = side * std::min(factors.feed, factors.across);
+    const double longSide = side * std::max(factors.feed, factors.across);
+    if (shortSide < 1.0 || longSide > 10000000.0) {
+        MessageBoxW(dialog, L"The calibrated side length is outside the supported range.", L"Test square",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    wchar_t filename[MAX_PATH * 2] = L"Calibration square";
+    OPENFILENAMEW save{};
+    save.lStructSize = sizeof(save);
+    save.hwndOwner = dialog;
+    save.lpstrFilter = L"HP-GL/2 plot file (*.plt)\0*.plt\0Monochrome raster (*.pbm)\0*.pbm\0";
+    save.nFilterIndex = 1;
+    save.lpstrFile = filename;
+    save.nMaxFile = static_cast<DWORD>(std::size(filename));
+    save.lpstrTitle = L"Export calibration test square";
+    save.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&save)) return;
+
+    const bool raster = save.nFilterIndex == 2;
+    auto output = std::filesystem::path(filename);
+    output.replace_extension(raster ? L".pbm" : L".plt");
+    // Keep the stroke inside the image even at the lowest supported DPI.
+    const double margin = std::max(S.cfg.lineWidthMm, 2.0 * 25.4 / S.cfg.rasterDpi) / kHpglOutputStepMm;
+    const double x0 = margin, y0 = margin;
+    const double x1 = x0 + side * factors.feed;
+    const double y1 = y0 + side * factors.across;
+
+    rm::Piece piece;
+    rm::Op selectPen(rm::K::Raw);
+    selectPen.text = "SP1";
+    piece.ops.push_back(std::move(selectPen));
+    rm::Op move(rm::K::Pts);
+    move.verb = "PU";
+    move.pts = {{x0, y0}};
+    piece.ops.push_back(std::move(move));
+    rm::Op draw(rm::K::Pts);
+    draw.verb = "PD";
+    draw.pts = {{x1, y0}, {x1, y1}, {x0, y1}, {x0, y0}};
+    piece.ops.push_back(std::move(draw));
+    rm::Op lift(rm::K::Pts);
+    lift.verb = "PU";
+    piece.ops.push_back(std::move(lift));
+
+    std::string error;
+    try {
+        const rp::Stream stream = rp::makeStream(piece, kHpglOutputStepMm);
+        if (raster) {
+            const double onePixel = 25.4 / S.cfg.rasterDpi / kHpglOutputStepMm;
+            if (shortSide < onePixel) {
+                error = "The square is smaller than one raster pixel. Increase its size or the export DPI.";
+            } else {
+                writePlotRaster(piece, stream, rp::makePlan(stream, 0, 100), {}, y1 + margin,
+                                S.cfg.rasterDpi, S.cfg.lineWidthMm, output.wstring(), error);
+            }
+        } else {
+            const std::string bytes = rp::streamText(stream) + "SP0;\n";
+            if (FILE* file = _wfopen(output.c_str(), L"wbx")) {
+                const bool written = fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+                if (fclose(file) != 0 || !written) {
+                    DeleteFileW(output.c_str());
+                    error = "Could not finish writing the plot file.";
+                }
+            } else {
+                error = "Could not create the plot file. Check permissions or choose a new output name.";
+            }
+        }
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    if (error.empty()) {
+        SetDlgItemTextW(dialog, IDC_FEED_EXPECTED, calibrationText(*sideCm * 10.0).c_str());
+        SetDlgItemTextW(dialog, IDC_ACROSS_EXPECTED, calibrationText(*sideCm * 10.0).c_str());
+        MessageBoxW(dialog, (L"Saved " + output.wstring()).c_str(), L"Test square", MB_OK | MB_ICONINFORMATION);
+    } else {
+        MessageBoxW(dialog, wide(error).c_str(), L"Test square", MB_OK | MB_ICONERROR);
+    }
+}
 INT_PTR CALLBACK calibrationDialog(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto* factors = reinterpret_cast<cal::Factors*>(GetWindowLongPtrW(hwnd, DWLP_USER));
     if (msg == WM_INITDIALOG) {
         factors = reinterpret_cast<cal::Factors*>(lp);
         SetWindowLongPtrW(hwnd, DWLP_USER, lp);
+        SendDlgItemMessageW(hwnd, IDC_TEST_SQUARE_SIZE, EM_SETLIMITTEXT, 63, 0);
+        SetDlgItemTextW(hwnd, IDC_TEST_SQUARE_SIZE, L"10");
     } else if (msg != WM_COMMAND) {
         return FALSE;
     }
@@ -589,6 +681,9 @@ INT_PTR CALLBACK calibrationDialog(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case IDOK:
             case IDCANCEL:
                 EndDialog(hwnd, id);
+                return TRUE;
+            case IDC_TEST_SQUARE_EXPORT:
+                exportCalibrationSquare(hwnd, *factors);
                 return TRUE;
             case IDC_CALIBRATION_RESET:
                 *factors = {};
@@ -1493,21 +1588,41 @@ void layoutAll(int w, int h) {
     int barH = rows * rowH + (rows - 1) * rowGap + 2 * dp(8);
     int statusH = dp(58);
     int barTop = h - barH - statusH;
+    struct Bounds {
+        HWND window;
+        int x, y, width, height;
+    };
+    std::vector<Bounds> children;
+    children.reserve(S.slots.size() + 4);
     for (size_t k = 0; k < S.slots.size(); ++k) {
-        const Slot& s = S.slots[k];
-        int y = barTop + dp(8) + pos[k].second * (rowH + rowGap) + (rowH - s.height) / 2;
-        MoveWindow(s.hwnd, pos[k].first, y, s.width, s.height + s.extra, TRUE);
+        const Slot& slot = S.slots[k];
+        int y = barTop + dp(8) + pos[k].second * (rowH + rowGap) + (rowH - slot.height) / 2;
+        children.push_back({slot.hwnd, pos[k].first, y, slot.width, slot.height + slot.extra});
     }
     int bodyTop = dp(10);
     int listW = dp(300);
     int bodyH = std::max(barTop - dp(6) - bodyTop, dp(50));
-    MoveWindow(S.list, dp(10), bodyTop, listW, bodyH, TRUE);
+    children.push_back({S.list, dp(10), bodyTop, listW, bodyH});
     int px = dp(10) + listW + dp(10);
-    MoveWindow(S.preview, px, bodyTop, std::max(w - px - dp(10), dp(50)), bodyH, TRUE);
+    children.push_back({S.preview, px, bodyTop, std::max(w - px - dp(10), dp(50)), bodyH});
     int statusTop = h - statusH;
     int statusWidth = std::max(w - 2 * margin, 1);
-    MoveWindow(S.usbStatus, margin, statusTop, statusWidth, dp(22), TRUE);
-    MoveWindow(S.status, margin, statusTop + dp(23), statusWidth, dp(32), TRUE);
+    children.push_back({S.usbStatus, margin, statusTop, statusWidth, dp(22)});
+    children.push_back({S.status, margin, statusTop + dp(23), statusWidth, dp(32)});
+
+    constexpr UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
+    HDWP batch = BeginDeferWindowPos(static_cast<int>(children.size()));
+    for (const Bounds& child : children) {
+        if (!batch) break;
+        batch = DeferWindowPos(batch, child.window, nullptr, child.x, child.y, child.width, child.height, flags);
+    }
+    if (!batch || !EndDeferWindowPos(batch)) {
+        for (const Bounds& child : children) {
+            SetWindowPos(child.window, nullptr, child.x, child.y, child.width, child.height, flags);
+        }
+    }
+    // Erase the old toolbar and status positions after every child has moved.
+    RedrawWindow(S.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
 void drawListItem(DRAWITEMSTRUCT* di) {
@@ -1589,7 +1704,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (wParam == kUsbStatusTimer && !S.running) updateUsbStatus();
             return 0;
         case WM_SIZE:
-            if (S.preview) {
+            if (S.preview && wParam != SIZE_MINIMIZED) {
                 layoutAll(LOWORD(lParam), HIWORD(lParam));
             }
             return 0;

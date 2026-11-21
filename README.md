@@ -28,3 +28,5 @@ The default backend uses WinUSB for Algotex USB device `135D:F001`. Configure th
 **Export raster** writes one PBM per queued file to the existing folder configured in `RasterOutput`. The output uses the selected data step, header option, range, paper width, and calibration. The default 300 dpi is for raster inspection. VEGA printing still requires the print-job handshake and raster encoding to be verified on a working device session.
 
 Plotter settings default to `%LOCALAPPDATA%\Ralvioli Suite\Ralvioli Plotter.ini`. For a portable build, place the sample `RalvioliPlotter.ini` next to the executable as `Ralvioli Plotter.ini`. If no INI sets `RasterOutput`, raster export is unavailable.
+
+In **Calibrate**, enter a test square side in centimeters and select **Export test square**. Save it as HP-GL/2 for a working print setup or as PBM for raster inspection. The export applies the factors currently shown in the dialog and fills both expected lengths in millimeters.
