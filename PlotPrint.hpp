@@ -1,11 +1,13 @@
 #pragma once
 
 #include "PlotStream.hpp"
+#include <atomic>
 
-// Diagnostic PBM: columns run across the paper, rows run along the feed.
-inline bool writePlotRaster(const rm::Piece& piece, const rp::Stream& stream, const rp::Plan& plan,
+// The monochrome bitmap stays in memory. The Windows printer driver receives it at physical size.
+inline bool printPlot(const rm::Piece& piece, const rp::Stream& stream, const rp::Plan& plan,
                             cal::Factors calibration, double paperUnits, int dpi, double lineWidthMm,
-                            const std::wstring& path, std::string& error) {
+                            HDC printer, const std::wstring& title, const std::atomic_bool& stop, std::string& error) {
+    if (stop) return false;
     const auto drawing = rp::buildDrawing(piece, stream);
     const auto selected = [&](int line) {
         return line >= 0 && static_cast<size_t>(line) < plan.lineIn.size() && plan.lineIn[line];
@@ -51,10 +53,17 @@ inline bool writePlotRaster(const rm::Piece& piece, const rp::Stream& stream, co
     const size_t rowBytes = (width + 7) / 8;
     const size_t stride = (rowBytes + 3) & ~size_t{3};
     if (stride * height > 128 * 1024 * 1024) {
-        error = "Raster exceeds 128 MiB. Reduce DPI or select a shorter range.";
+        error = "Raster exceeds 128 MiB. Select a shorter range.";
         return false;
     }
 
+    const double printWidth = std::round(static_cast<double>(width) * GetDeviceCaps(printer, LOGPIXELSX) / dpi);
+    const double printHeight = std::round(static_cast<double>(height) * GetDeviceCaps(printer, LOGPIXELSY) / dpi);
+    if (!(printWidth >= 1 && printWidth <= GetDeviceCaps(printer, HORZRES) &&
+          printHeight >= 1 && printHeight <= GetDeviceCaps(printer, VERTRES))) {
+        error = "The job does not fit the printer's printable area. Select a larger paper size or a shorter range.";
+        return false;
+    }
     struct {
         BITMAPINFOHEADER header{};
         RGBQUAD palette[2]{{255, 255, 255, 0}, {0, 0, 0, 0}};
@@ -119,20 +128,25 @@ inline bool writePlotRaster(const rm::Piece& piece, const rp::Stream& stream, co
     if (!ok) {
         error = "Windows could not render the raster.";
     } else {
-        FILE* out = _wfopen(path.c_str(), L"wbx");
-        if (!out) {
-            error = "Could not create the PBM file. Check permissions or choose a new output name.";
+        DOCINFOW doc{};
+        doc.cbSize = sizeof(doc);
+        doc.lpszDocName = title.c_str();
+        if (StartDocW(printer, &doc) <= 0) {
+            error = "Windows could not start the print job.";
             ok = false;
         } else {
-            ok = std::fprintf(out, "P4\n%d %d\n", width, height) > 0;
-            const auto* row = static_cast<const unsigned char*>(pixels);
-            for (int y = 0; ok && y < height; ++y, row += stride) {
-                ok = std::fwrite(row, 1, rowBytes, out) == rowBytes;
+            ok = StartPage(printer) > 0;
+            if (ok) {
+                SetStretchBltMode(printer, BLACKONWHITE);
+                const int lines = StretchDIBits(printer, 0, 0, static_cast<int>(printWidth),
+                                                static_cast<int>(printHeight), 0, 0, width, height, pixels,
+                                                reinterpret_cast<BITMAPINFO*>(&info), DIB_RGB_COLORS, SRCCOPY);
+                ok = lines != GDI_ERROR && lines != 0 && EndPage(printer) > 0;
             }
-            ok = std::fclose(out) == 0 && ok;
+            if (ok) ok = EndDoc(printer) > 0;
             if (!ok) {
-                DeleteFileW(path.c_str());
-                error = "Could not finish writing the PBM file.";
+                AbortDoc(printer);
+                error = "Windows could not submit the printed page.";
             }
         }
     }

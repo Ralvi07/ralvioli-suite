@@ -24,7 +24,7 @@
 #include "RalvioliUsb.hpp"
 #include "RalvioliWinUsb.hpp"
 #include "PlotterResource.h"
-#include "PlotRaster.hpp"
+#include "PlotPrint.hpp"
 #include "Protocol.hpp"
 #include <filesystem>
 
@@ -93,11 +93,9 @@ struct Settings {
     UINT pid = 0xF001;
     int pipe = 1;
     int pipeIn = 129;
-    int rasterDpi = 300;
     double lineWidthMm = 0.4;
     int timeoutMs = 2000;
     bool libusbK = false;
-    std::wstring rasterOutput;
     std::wstring ini;
 };
 
@@ -112,6 +110,7 @@ struct State {
     HWND status = nullptr;
     HWND usbStatus = nullptr;
     HWND btnCalibrate = nullptr;
+    HWND calibrationWindow = nullptr;
     HWND btnAdd = nullptr;
     HWND btnRemove = nullptr;
     HWND btnStart = nullptr;
@@ -292,15 +291,9 @@ void loadSettings() {
     S.cfg.pid = static_cast<UINT>(std::wcstoul(iniText(L"Pid", L"F001").c_str(), nullptr, 16));
     S.cfg.pipe = static_cast<int>(std::wcstol(iniText(L"Pipe", L"1").c_str(), nullptr, 10));
     S.cfg.pipeIn = GetPrivateProfileIntW(L"Plotter", L"PipeIn", 129, S.cfg.ini.c_str());
-    S.cfg.rasterDpi = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Plotter", L"Dpi", 300, S.cfg.ini.c_str())), 25, 1200);
     S.cfg.lineWidthMm = std::clamp(positiveNumber(iniText(L"LineWidthMm", L"0.4")).value_or(0.4), 0.01, 5.0);
     S.cfg.timeoutMs = std::clamp(std::wcstol(iniText(L"TimeoutMs", L"2000").c_str(), nullptr, 10), 100L, 60000L);
     S.cfg.libusbK = _wcsicmp(iniText(L"Backend", L"WinUSB").c_str(), L"libusbK") == 0;
-    S.cfg.rasterOutput = iniText(L"RasterOutput", L"");
-    if (!S.cfg.rasterOutput.empty()) {
-        const std::filesystem::path output(S.cfg.rasterOutput);
-        S.cfg.rasterOutput = (std::filesystem::path(S.cfg.ini).parent_path() / output).wstring();
-    }
     std::wstring calibration = iniText(L"Calibration", L"1|1");
     size_t separator = calibration.find(L'|');
     if (separator != std::wstring::npos) {
@@ -574,103 +567,78 @@ std::wstring calibrationText(double factor, bool forDisplay = false) {
     return std::wstring(text, result.ptr);
 }
 
-void exportCalibrationSquare(HWND dialog, cal::Factors factors) {
-    wchar_t sizeText[64]{};
-    GetDlgItemTextW(dialog, IDC_TEST_SQUARE_SIZE, sizeText, 64);
-    const auto sideCm = positiveNumber(sizeText);
-    if (!sideCm) {
-        MessageBoxW(dialog, L"Enter a positive side length in centimeters.", L"Test square", MB_OK | MB_ICONWARNING);
-        SetFocus(GetDlgItem(dialog, IDC_TEST_SQUARE_SIZE));
-        return;
-    }
-
-    const double side = *sideCm * rm::kUnitsPerCm;
-    const double shortSide = side * std::min(factors.feed, factors.across);
-    const double longSide = side * std::max(factors.feed, factors.across);
-    if (shortSide < 1.0 || longSide > 10000000.0) {
-        MessageBoxW(dialog, L"The calibrated side length is outside the supported range.", L"Test square",
-                    MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    wchar_t filename[MAX_PATH * 2] = L"Calibration square";
-    OPENFILENAMEW save{};
-    save.lStructSize = sizeof(save);
-    save.hwndOwner = dialog;
-    save.lpstrFilter = L"HP-GL/2 plot file (*.plt)\0*.plt\0Monochrome raster (*.pbm)\0*.pbm\0";
-    save.nFilterIndex = 1;
-    save.lpstrFile = filename;
-    save.nMaxFile = static_cast<DWORD>(std::size(filename));
-    save.lpstrTitle = L"Export calibration test square";
-    save.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (!GetSaveFileNameW(&save)) return;
-
-    const bool raster = save.nFilterIndex == 2;
-    auto output = std::filesystem::path(filename);
-    output.replace_extension(raster ? L".pbm" : L".plt");
-    // Keep the stroke inside the image even at the lowest supported DPI.
-    const double margin = std::max(S.cfg.lineWidthMm, 2.0 * 25.4 / S.cfg.rasterDpi) / kHpglOutputStepMm;
-    const double x0 = margin, y0 = margin;
-    const double x1 = x0 + side * factors.feed;
-    const double y1 = y0 + side * factors.across;
-
+struct Job {
+    int index = -1;
     rm::Piece piece;
-    rm::Op selectPen(rm::K::Raw);
-    selectPen.text = "SP1";
-    piece.ops.push_back(std::move(selectPen));
+    rp::Stream stream;
+    rp::Plan plan;
+    std::wstring title;
+};
+
+bool startWindowsPrint(HWND owner, std::vector<Job> jobs, double paperWidth, cal::Factors factors);
+
+void printCalibrationRectangle(HWND dialog, cal::Factors factors) {
+    if (S.running) return;
+    wchar_t widthText[64]{}, lengthText[64]{};
+    GetDlgItemTextW(dialog, IDC_TEST_RECT_WIDTH, widthText, 64);
+    GetDlgItemTextW(dialog, IDC_TEST_RECT_LENGTH, lengthText, 64);
+    const auto widthCm = positiveNumber(widthText);
+    const auto lengthCm = positiveNumber(lengthText);
+    if (!widthCm || !lengthCm) {
+        MessageBoxW(dialog, L"Enter a positive width and length in centimeters.", L"Test rectangle",
+                    MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(dialog, widthCm ? IDC_TEST_RECT_LENGTH : IDC_TEST_RECT_WIDTH));
+        return;
+    }
+
+    const double width = *widthCm * rm::kUnitsPerCm;
+    const double length = *lengthCm * rm::kUnitsPerCm;
+    const double across = width * factors.across;
+    const double feed = length * factors.feed;
+    if (!(across >= 1.0 && across <= 10000000.0 && feed >= 1.0 && feed <= 10000000.0)) {
+        MessageBoxW(dialog, L"The calibrated rectangle is outside the supported size range.",
+                    L"Test rectangle", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Leave a small margin inside the printer's printable area around the stroke.
+    const double margin = std::max(2.0, S.cfg.lineWidthMm) / kHpglOutputStepMm;
+    Job job;
+    job.title = L"Calibration test rectangle";
     rm::Op move(rm::K::Pts);
     move.verb = "PU";
-    move.pts = {{x0, y0}};
-    piece.ops.push_back(std::move(move));
+    move.pts = {{margin, margin}};
+    job.piece.ops.push_back(std::move(move));
     rm::Op draw(rm::K::Pts);
     draw.verb = "PD";
-    draw.pts = {{x1, y0}, {x1, y1}, {x0, y1}, {x0, y0}};
-    piece.ops.push_back(std::move(draw));
-    rm::Op lift(rm::K::Pts);
-    lift.verb = "PU";
-    piece.ops.push_back(std::move(lift));
-
-    std::string error;
-    try {
-        const rp::Stream stream = rp::makeStream(piece, kHpglOutputStepMm);
-        if (raster) {
-            const double onePixel = 25.4 / S.cfg.rasterDpi / kHpglOutputStepMm;
-            if (shortSide < onePixel) {
-                error = "The square is smaller than one raster pixel. Increase its size or the export DPI.";
-            } else {
-                writePlotRaster(piece, stream, rp::makePlan(stream, 0, 100), {}, y1 + margin,
-                                S.cfg.rasterDpi, S.cfg.lineWidthMm, output.wstring(), error);
-            }
-        } else {
-            const std::string bytes = rp::streamText(stream) + "SP0;\n";
-            if (FILE* file = _wfopen(output.c_str(), L"wbx")) {
-                const bool written = fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
-                if (fclose(file) != 0 || !written) {
-                    DeleteFileW(output.c_str());
-                    error = "Could not finish writing the plot file.";
-                }
-            } else {
-                error = "Could not create the plot file. Check permissions or choose a new output name.";
-            }
-        }
-    } catch (const std::exception& e) {
-        error = e.what();
-    }
-    if (error.empty()) {
-        SetDlgItemTextW(dialog, IDC_FEED_EXPECTED, calibrationText(*sideCm * 10.0).c_str());
-        SetDlgItemTextW(dialog, IDC_ACROSS_EXPECTED, calibrationText(*sideCm * 10.0).c_str());
-        MessageBoxW(dialog, (L"Saved " + output.wstring()).c_str(), L"Test square", MB_OK | MB_ICONINFORMATION);
-    } else {
-        MessageBoxW(dialog, wide(error).c_str(), L"Test square", MB_OK | MB_ICONERROR);
+    draw.pts = {{margin + feed, margin}, {margin + feed, margin + across},
+                {margin, margin + across}, {margin, margin}};
+    job.piece.ops.push_back(std::move(draw));
+    job.stream = rp::makeStream(job.piece, kHpglOutputStepMm);
+    job.plan = rp::makePlan(job.stream, 0, 100);
+    std::vector<Job> jobs;
+    jobs.push_back(std::move(job));
+    if (startWindowsPrint(dialog, std::move(jobs), across + 2 * margin, {})) {
+        SetDlgItemTextW(dialog, IDC_TEST_RECT_STATUS, L"Submitting test rectangle...");
+        SetDlgItemTextW(dialog, IDC_FEED_EXPECTED, calibrationText(*lengthCm * 10.0).c_str());
+        SetDlgItemTextW(dialog, IDC_ACROSS_EXPECTED, calibrationText(*widthCm * 10.0).c_str());
     }
 }
 INT_PTR CALLBACK calibrationDialog(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto* factors = reinterpret_cast<cal::Factors*>(GetWindowLongPtrW(hwnd, DWLP_USER));
+    if (msg == WM_DESTROY) {
+        S.calibrationWindow = nullptr;
+        return FALSE;
+    }
     if (msg == WM_INITDIALOG) {
+        S.calibrationWindow = hwnd;
         factors = reinterpret_cast<cal::Factors*>(lp);
         SetWindowLongPtrW(hwnd, DWLP_USER, lp);
-        SendDlgItemMessageW(hwnd, IDC_TEST_SQUARE_SIZE, EM_SETLIMITTEXT, 63, 0);
-        SetDlgItemTextW(hwnd, IDC_TEST_SQUARE_SIZE, L"10");
+        for (int edit : {IDC_TEST_RECT_WIDTH, IDC_TEST_RECT_LENGTH}) {
+            SendDlgItemMessageW(hwnd, edit, EM_SETLIMITTEXT, 63, 0);
+        }
+        SetDlgItemTextW(hwnd, IDC_TEST_RECT_WIDTH, L"10");
+        SetDlgItemTextW(hwnd, IDC_TEST_RECT_LENGTH, L"15");
     } else if (msg != WM_COMMAND) {
         return FALSE;
     }
@@ -682,8 +650,8 @@ INT_PTR CALLBACK calibrationDialog(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case IDCANCEL:
                 EndDialog(hwnd, id);
                 return TRUE;
-            case IDC_TEST_SQUARE_EXPORT:
-                exportCalibrationSquare(hwnd, *factors);
+            case IDC_TEST_RECT_PRINT:
+                printCalibrationRectangle(hwnd, *factors);
                 return TRUE;
             case IDC_CALIBRATION_RESET:
                 *factors = {};
@@ -1198,19 +1166,12 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 // ---------------------------------------------------------------- printing
-struct Job {
-    int index;
-    rm::Piece piece;
-    rp::Stream stream;
-    rp::Plan plan;
-    std::wstring path;
-};
-
 struct ThreadArg {
     std::vector<Job> jobs;
     Settings cfg;
     HWND hwnd;
-    bool testUsb = false;
+    HDC printer = nullptr;
+    ~ThreadArg() { if (printer) DeleteDC(printer); }
     double paperWidth = 0;
     cal::Factors calibration;
 };
@@ -1280,7 +1241,7 @@ bool checkVega(Transport& usb, std::string& log, std::string& result) {
 
 DWORD WINAPI printThread(LPVOID p) {
     std::unique_ptr<ThreadArg> a(static_cast<ThreadArg*>(p));
-    if (a->testUsb) {
+    if (!a->printer) {
         std::unique_ptr<Transport> usb;
         if (a->cfg.libusbK) {
             auto backend = std::make_unique<LibUsbKTransport>(a->cfg.vid, a->cfg.pid, a->cfg.pipe, a->cfg.timeoutMs);
@@ -1310,20 +1271,23 @@ DWORD WINAPI printThread(LPVOID p) {
             detail.release();
         }
     } else {
+        SetAbortProc(a->printer, [](HDC, int) -> BOOL { return !g_stop; });
         for (const Job& job : a->jobs) {
             if (g_stop) break;
             std::string error;
             PostMessageW(a->hwnd, kMsgProg, job.index, 0);
-            bool saved = false;
+            bool submitted = false;
             try {
-                saved = writePlotRaster(job.piece, job.stream, job.plan, a->calibration, a->paperWidth,
-                                        a->cfg.rasterDpi, a->cfg.lineWidthMm, job.path, error);
+                const int dpi = std::clamp(std::max(GetDeviceCaps(a->printer, LOGPIXELSX),
+                                                   GetDeviceCaps(a->printer, LOGPIXELSY)), 75, 600);
+                submitted = printPlot(job.piece, job.stream, job.plan, a->calibration, a->paperWidth,
+                                      dpi, a->cfg.lineWidthMm, a->printer, job.title, g_stop, error);
             } catch (const std::exception& e) {
                 error = e.what();
             }
-            if (!saved) postError(a->hwnd, utf8(job.path) + ": " + error);
-            PostMessageW(a->hwnd, kMsgDone, job.index, saved ? 0 : 2);
-            if (!saved) break;
+            if (!submitted && !g_stop) postError(a->hwnd, utf8(job.title) + ": " + error);
+            PostMessageW(a->hwnd, kMsgDone, job.index, submitted ? 0 : g_stop ? 1 : 2);
+            if (!submitted) break;
         }
     }
     PostMessageW(a->hwnd, kMsgFinished, 0, 0);
@@ -1349,7 +1313,6 @@ void testUsb() {
     auto a = std::make_unique<ThreadArg>();
     a->cfg = S.cfg;
     a->hwnd = S.hwnd;
-    a->testUsb = true;
     S.thread = CreateThread(nullptr, 0, printThread, a.get(), 0, nullptr);
     if (!S.thread) {
         setStatus(L"Could not start the USB test: " + wide(winErrorText(GetLastError())), true);
@@ -1363,11 +1326,6 @@ void testUsb() {
 
 void startPrint() {
     if (S.running || S.layers.empty()) {
-        return;
-    }
-    if (S.cfg.rasterOutput.empty()) {
-        message(L"VEGA print packets are still unverified. Use Check plotter for USB diagnostics or configure RasterOutput to export PBM files.",
-                L"VEGA printing", MB_ICONINFORMATION);
         return;
     }
     std::optional<double> width = paperUnits();
@@ -1389,11 +1347,7 @@ void startPrint() {
         message(L"File " + list + L" goes past the paper width.", L"Outside the paper", MB_ICONERROR);
         return;
     }
-    std::unique_ptr<ThreadArg> a(new ThreadArg);
-    a->cfg = S.cfg;
-    a->hwnd = S.hwnd;
-    a->paperWidth = *width;
-    a->calibration = S.calibration;
+    std::vector<Job> jobs;
     std::wstring problems;
     for (int i = first; i < static_cast<int>(S.layers.size()); ++i) {
         Layer& l = S.layers[static_cast<size_t>(i)];
@@ -1420,10 +1374,8 @@ void startPrint() {
             j.piece = std::move(placed[0]);
             j.stream = std::move(st);
             j.plan = std::move(plan);
-            auto output = std::filesystem::path(S.cfg.rasterOutput) / baseName(l.path);
-            output += L".pbm";
-            j.path = output.wstring();
-            a->jobs.push_back(std::move(j));
+            j.title = baseName(l.path);
+            jobs.push_back(std::move(j));
         } catch (const std::exception& e) {
             l.status = L"error";
             problems += baseName(l.path) + L": " + wide(e.what()) + L"\n";
@@ -1435,23 +1387,52 @@ void startPrint() {
         setStatus(L"File error: " + problems, true);
         message(problems, L"Some files cannot be printed", MB_ICONERROR);
     }
-    if (a->jobs.empty()) {
-        rebuildView();
-        return;
+    if (!jobs.empty() && !startWindowsPrint(S.hwnd, std::move(jobs), *width, S.calibration)) {
+        for (Layer& layer : S.layers) {
+            if (layer.status == L"queued") {
+                layer.status.clear();
+                layer.total = 0;
+            }
+        }
     }
-    g_stop = false;
-    setRunning(true);
-    setStatus(L"Preparing raster export...", false);
     rebuildView();
-    S.thread = CreateThread(nullptr, 0, printThread, a.get(), 0, nullptr);
-    if (S.thread) {
-        a.release();
-    } else {
-        setStatus(L"Could not start the print worker: " + wide(winErrorText(GetLastError())), true);
-        PostMessageW(S.hwnd, kMsgFinished, 0, 0);
-    }
+    InvalidateRect(S.list, nullptr, FALSE);
 }
 
+bool startWindowsPrint(HWND owner, std::vector<Job> jobs, double paperWidth, cal::Factors factors) {
+    PRINTDLGW dlg{};
+    dlg.lStructSize = sizeof(dlg);
+    dlg.hwndOwner = owner;
+    dlg.Flags = PD_RETURNDC | PD_NOSELECTION | PD_NOPAGENUMS | PD_DISABLEPRINTTOFILE;
+    dlg.nCopies = 1;
+    const bool selected = PrintDlgW(&dlg) != FALSE;
+    const DWORD dialogError = selected ? 0 : CommDlgExtendedError();
+    if (dlg.hDevMode) GlobalFree(dlg.hDevMode);
+    if (dlg.hDevNames) GlobalFree(dlg.hDevNames);
+    auto args = std::make_unique<ThreadArg>();
+    args->printer = dlg.hDC;
+    if (!selected || !args->printer) {
+        if (dialogError || selected) {
+            MessageBoxW(owner, L"Windows could not open the selected printer.", L"Print", MB_OK | MB_ICONERROR);
+        }
+        return false;
+    }
+    args->cfg = S.cfg;
+    args->hwnd = S.hwnd;
+    args->jobs = std::move(jobs);
+    args->paperWidth = paperWidth;
+    args->calibration = factors;
+    g_stop = false;
+    S.thread = CreateThread(nullptr, 0, printThread, args.get(), 0, nullptr);
+    if (!S.thread) {
+        MessageBoxW(owner, wide(winErrorText(GetLastError())).c_str(), L"Print", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    args.release();
+    setRunning(true);
+    setStatus(L"Submitting to Windows printer...", false);
+    return true;
+}
 // ---------------------------------------------------------------- controls
 HWND makeButton(HWND parent, int id, const wchar_t* text) {
     HWND h = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 10, 10,
@@ -1526,7 +1507,7 @@ void createControls(HWND hwnd) {
     S.editTo = addEdit(hwnd, ID_TO, 52, dp(22));
 
     S.btnCalibrate = addButton(hwnd, ID_CALIBRATE, L"Calibrate", 74, dp(22), false);
-    S.btnStart = addButton(hwnd, ID_START, L"Export raster", 40, dp(4), true);
+    S.btnStart = addButton(hwnd, ID_START, L"Print", 40, dp(4), true);
     S.btnStop = addButton(hwnd, ID_STOP, L"Stop", 40, 0, false);
     S.btnTestUsb = addButton(hwnd, ID_TEST_USB, L"Check plotter", 70, 0, false);
     EnableWindow(S.btnStop, FALSE);
@@ -1812,6 +1793,13 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case kMsgDone: {
+            if (static_cast<int>(wParam) == -1) {
+                const wchar_t* status = lParam == 0 ? L"Test rectangle submitted to Windows printer." :
+                    lParam == 1 ? L"Test rectangle stopped." : L"Test rectangle failed. See Plotter status for details.";
+                if (lParam != 2) setStatus(status, false);
+                if (S.calibrationWindow) SetDlgItemTextW(S.calibrationWindow, IDC_TEST_RECT_STATUS, status);
+                return 0;
+            }
             size_t i = static_cast<size_t>(wParam);
             if (i >= S.layers.size()) {
                 return 0;
@@ -1820,8 +1808,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (lParam == 0) {
                 l.pct = 100;
                 l.sent = l.total;
-                l.status = L"raster saved";
-                setStatus(std::wstring(L"Saved raster for ") + baseName(l.path), false);
+                l.status = L"submitted";
+                setStatus(std::wstring(L"Submitted ") + baseName(l.path), false);
             } else if (lParam == 1) {
                 l.status = L"stopped " + std::to_wstring(l.pct) + L"%";
                 setStatus(L"Stopped " + baseName(l.path) + L" at " + std::to_wstring(l.pct) + L"%", false);
