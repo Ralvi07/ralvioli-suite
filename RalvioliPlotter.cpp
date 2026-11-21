@@ -24,6 +24,9 @@
 #include "RalvioliUsb.hpp"
 #include "RalvioliWinUsb.hpp"
 #include "PlotterResource.h"
+#include "PlotRaster.hpp"
+#include "Protocol.hpp"
+#include <filesystem>
 
 namespace {
 
@@ -49,7 +52,6 @@ const UINT kMsgDone = WM_APP + 2;      // wParam layer, lParam 0 done / 1 stoppe
 const UINT kMsgError = WM_APP + 3;     // lParam new std::string*
 const UINT kMsgFinished = WM_APP + 4;
 const UINT kMsgUsbResult = WM_APP + 5;
-const UINT kMsgTransportOpen = WM_APP + 6;
 const UINT_PTR kUsbStatusTimer = 1;
 
 const COLORREF kColors[] = {RGB(0x15, 0x65, 0xc0), RGB(0xc6, 0x28, 0x28), RGB(0x2e, 0x7d, 0x32),
@@ -89,11 +91,13 @@ struct Slot {
 struct Settings {
     UINT vid = 0x135D;
     UINT pid = 0xF001;
-    int pipe = -1;
-    int chunk = 4096;
+    int pipe = 1;
+    int pipeIn = 129;
+    int rasterDpi = 300;
+    double lineWidthMm = 0.4;
     int timeoutMs = 2000;
     bool libusbK = false;
-    std::wstring dryRun;
+    std::wstring rasterOutput;
     std::wstring ini;
 };
 
@@ -134,7 +138,6 @@ struct State {
     std::wstring statusText;
     std::wstring queueWarning;
     bool statusError = false;
-    bool transportOpen = false;
     bool updating = false;
     bool autoFit = true;
     double vx = 0.0;
@@ -287,11 +290,17 @@ void loadSettings() {
     }
     S.cfg.vid = static_cast<UINT>(std::wcstoul(iniText(L"Vid", L"135D").c_str(), nullptr, 16));
     S.cfg.pid = static_cast<UINT>(std::wcstoul(iniText(L"Pid", L"F001").c_str(), nullptr, 16));
-    S.cfg.pipe = static_cast<int>(std::wcstol(iniText(L"Pipe", L"-1").c_str(), nullptr, 10));
-    S.cfg.chunk = std::max(64, std::min(65536, static_cast<int>(std::wcstol(iniText(L"Chunk", L"4096").c_str(), nullptr, 10))));
+    S.cfg.pipe = static_cast<int>(std::wcstol(iniText(L"Pipe", L"1").c_str(), nullptr, 10));
+    S.cfg.pipeIn = GetPrivateProfileIntW(L"Plotter", L"PipeIn", 129, S.cfg.ini.c_str());
+    S.cfg.rasterDpi = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Plotter", L"Dpi", 300, S.cfg.ini.c_str())), 25, 1200);
+    S.cfg.lineWidthMm = std::clamp(positiveNumber(iniText(L"LineWidthMm", L"0.4")).value_or(0.4), 0.01, 5.0);
     S.cfg.timeoutMs = std::clamp(std::wcstol(iniText(L"TimeoutMs", L"2000").c_str(), nullptr, 10), 100L, 60000L);
     S.cfg.libusbK = _wcsicmp(iniText(L"Backend", L"WinUSB").c_str(), L"libusbK") == 0;
-    S.cfg.dryRun = iniText(L"DryRun", L"");
+    S.cfg.rasterOutput = iniText(L"RasterOutput", L"");
+    if (!S.cfg.rasterOutput.empty()) {
+        const std::filesystem::path output(S.cfg.rasterOutput);
+        S.cfg.rasterOutput = (std::filesystem::path(S.cfg.ini).parent_path() / output).wstring();
+    }
     std::wstring calibration = iniText(L"Calibration", L"1|1");
     size_t separator = calibration.find(L'|');
     if (separator != std::wstring::npos) {
@@ -331,16 +340,10 @@ void setStatus(const std::wstring& t, bool error) {
 
 void updateUsbStatus() {
     const wchar_t* text;
-    if (!S.cfg.dryRun.empty()) {
-        text = L"Printer: dry run";
-    } else if (S.transportOpen) {
-        text = L"Printer: USB session open";
-    } else {
-        switch (plotterUsbPresence(S.cfg.vid, S.cfg.pid)) {
-            case UsbPresence::Present: text = L"Printer: detected by Windows"; break;
-            case UsbPresence::Missing: text = L"Printer: USB device not detected"; break;
-            default: text = L"Printer: USB status unavailable"; break;
-        }
+    switch (plotterUsbPresence(S.cfg.vid, S.cfg.pid)) {
+        case UsbPresence::Present: text = L"Printer: detected by Windows"; break;
+        case UsbPresence::Missing: text = L"Printer: USB device not detected"; break;
+        default: text = L"Printer: USB status unavailable"; break;
     }
     SetWindowTextW(S.usbStatus, text);
 }
@@ -1102,7 +1105,10 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // ---------------------------------------------------------------- printing
 struct Job {
     int index;
-    std::string bytes;
+    rm::Piece piece;
+    rp::Stream stream;
+    rp::Plan plan;
+    std::wstring path;
 };
 
 struct ThreadArg {
@@ -1110,6 +1116,8 @@ struct ThreadArg {
     Settings cfg;
     HWND hwnd;
     bool testUsb = false;
+    double paperWidth = 0;
+    cal::Factors calibration;
 };
 
 void postError(HWND h, const std::string& s) {
@@ -1119,76 +1127,113 @@ void postError(HWND h, const std::string& s) {
     }
 }
 
-DWORD WINAPI printThread(LPVOID p) {
-    std::unique_ptr<ThreadArg> a(static_cast<ThreadArg*>(p));
-    std::unique_ptr<Transport> t;
-    if (!a->testUsb && !a->cfg.dryRun.empty()) {
-        t.reset(new FileTransport(a->cfg.dryRun));
-    } else if (a->cfg.libusbK) {
-        t.reset(new LibUsbKTransport(a->cfg.vid, a->cfg.pid, a->cfg.pipe, a->cfg.timeoutMs));
-    } else {
-        t.reset(new WinUsbTransport(a->cfg.vid, a->cfg.pid, a->cfg.pipe, a->cfg.timeoutMs));
+std::string hexBytes(const std::string& bytes) {
+    std::string hex;
+    for (unsigned char b : bytes) {
+        char text[4];
+        snprintf(text, sizeof(text), "%02X ", b);
+        hex += text;
     }
-    std::string err;
-    if (a->testUsb) {
-        bool opened = t->open(err);
-        std::string result = opened ? t->description() : err;
-        t->close();
-        auto message = std::make_unique<std::string>(std::move(result));
-        if (PostMessageW(a->hwnd, kMsgUsbResult, opened, reinterpret_cast<LPARAM>(message.get()))) {
-            message.release();
-        }
-        PostMessageW(a->hwnd, kMsgFinished, 0, 0);
-        return 0;
-    }
-    if (!t->open(err)) {
-        postError(a->hwnd, err);
-        for (const Job& j : a->jobs) {
-            PostMessageW(a->hwnd, kMsgDone, static_cast<WPARAM>(j.index), 2);
-        }
-        PostMessageW(a->hwnd, kMsgFinished, 0, 0);
-        return 0;
-    }
-    PostMessageW(a->hwnd, kMsgTransportOpen, 0, 0);
-    bool abort = false;
-    for (const Job& j : a->jobs) {
-        if (abort) {
-            break;
-        }
-        size_t off = 0;
-        size_t total = j.bytes.size();
-        bool failed = false;
-        PostMessageW(a->hwnd, kMsgProg, static_cast<WPARAM>(j.index), 0);
-        while (off < total && !g_stop) {
-            size_t n = std::min(static_cast<size_t>(a->cfg.chunk), total - off);
-            size_t done = 0;
-            int r = t->write(reinterpret_cast<const unsigned char*>(j.bytes.data()) + off, n, done, err);
-            off += done;
-            PostMessageW(a->hwnd, kMsgProg, static_cast<WPARAM>(j.index), static_cast<LPARAM>(off));
-            if (r != 0 || done == 0) {
-                if (err.empty()) {
-                    err = r == 1 ? "USB transfer timed out." : "No bytes were written.";
-                }
-                failed = true;
-                break;
+    return hex;
+}
+
+bool checkVega(Transport& usb, std::string& log, std::string& result) {
+    if (!usb.open(result)) return false;
+    log += usb.description() + "\n";
+    // AlgotexOcx 0x1000f746 -> 0x1001a0a0 -> 0x1001a020 stores the command big-endian.
+    const std::string request = proto::frame(0x3F, proto::be16(0x1A));
+    auto read = [&](std::string& value, const char* label) {
+        size_t offset = 0;
+        while (offset < value.size()) {
+            size_t got = 0;
+            const bool ok = usb.read(reinterpret_cast<unsigned char*>(value.data()) + offset,
+                                     value.size() - offset, got, result);
+            offset += got;
+            if (!ok || !got) {
+                log += std::string(label) + ": " + hexBytes(value.substr(0, offset)) + "\n";
+                if (ok) result = std::string("Empty read while receiving ") + label;
+                return false;
             }
         }
-        if (failed) {
-            postError(a->hwnd, err);
-            PostMessageW(a->hwnd, kMsgDone, static_cast<WPARAM>(j.index), 2);
-            abort = true;
-        } else if (off < total) {
-            PostMessageW(a->hwnd, kMsgDone, static_cast<WPARAM>(j.index), 1);
-            abort = true;
+        log += std::string(label) + ": " + hexBytes(value) + "\n";
+        return true;
+    };
+    std::string ack(1, '\0');
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        size_t sent = 0;
+        log += "Status request: " + hexBytes(request) + "\n";
+        if (usb.write(reinterpret_cast<const unsigned char*>(request.data()), request.size(), sent, result) ||
+            sent != request.size()) {
+            if (result.empty()) result = "Incomplete status request";
+            return false;
+        }
+        if (!read(ack, "ACK")) return false;
+        if (ack[0] != 1) break;
+    }
+    if (ack[0] != 0) {
+        result = "Plotter did not accept the status request";
+        return false;
+    }
+    std::string header(8, '\0');
+    size_t length = 0;
+    if (!read(header, "Reply header") || !proto::checkHeader(header, 0x1A, length, result)) return false;
+    std::string body(length + 2, '\0');
+    if (!read(body, "Reply body") || !proto::checkBody(header, body, result)) return false;
+    result = "VEGA status reply verified (" + std::to_string(length) + " data bytes)";
+    return true;
+}
+
+DWORD WINAPI printThread(LPVOID p) {
+    std::unique_ptr<ThreadArg> a(static_cast<ThreadArg*>(p));
+    if (a->testUsb) {
+        std::unique_ptr<Transport> usb;
+        if (a->cfg.libusbK) {
+            auto backend = std::make_unique<LibUsbKTransport>(a->cfg.vid, a->cfg.pid, a->cfg.pipe, a->cfg.timeoutMs);
+            backend->forceIn = a->cfg.pipeIn;
+            usb = std::move(backend);
         } else {
-            PostMessageW(a->hwnd, kMsgDone, static_cast<WPARAM>(j.index), 0);
+            auto backend = std::make_unique<WinUsbTransport>(a->cfg.vid, a->cfg.pid, a->cfg.pipe, a->cfg.timeoutMs);
+            backend->forceIn = a->cfg.pipeIn;
+            usb = std::move(backend);
+        }
+        std::string log = "Algotex VEGA status check\n";
+        std::string result;
+        const bool passed = checkVega(*usb, log, result);
+        usb->close();
+        log += result + "\n";
+        auto path = std::filesystem::path(a->cfg.ini);
+        path.replace_extension(L".usb.txt");
+        if (FILE* file = _wfopen(path.c_str(), L"wb")) {
+            const bool written = fwrite(log.data(), 1, log.size(), file) == log.size();
+            if (fclose(file) == 0 && written) result += " | Log: " + utf8(path.wstring());
+            else result += " | Could not write the USB log";
+        } else {
+            result += " | Could not open the USB log";
+        }
+        auto detail = std::make_unique<std::string>(std::move(result));
+        if (PostMessageW(a->hwnd, kMsgUsbResult, passed, reinterpret_cast<LPARAM>(detail.get()))) {
+            detail.release();
+        }
+    } else {
+        for (const Job& job : a->jobs) {
+            if (g_stop) break;
+            std::string error;
+            PostMessageW(a->hwnd, kMsgProg, job.index, 0);
+            bool saved = false;
+            try {
+                saved = writePlotRaster(job.piece, job.stream, job.plan, a->calibration, a->paperWidth,
+                                        a->cfg.rasterDpi, a->cfg.lineWidthMm, job.path, error);
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+            if (!saved) postError(a->hwnd, utf8(job.path) + ": " + error);
+            PostMessageW(a->hwnd, kMsgDone, job.index, saved ? 0 : 2);
+            if (!saved) break;
         }
     }
-    t->close();
     PostMessageW(a->hwnd, kMsgFinished, 0, 0);
     return 0;
 }
-
 void setRunning(bool running) {
     S.running = running;
     EnableWindow(S.btnAdd, !running);
@@ -1218,11 +1263,16 @@ void testUsb() {
     a.release();
     setRunning(true);
     EnableWindow(S.btnStop, FALSE);
-    setStatus(L"Checking USB...", false);
+    setStatus(L"Checking VEGA status...", false);
 }
 
 void startPrint() {
     if (S.running || S.layers.empty()) {
+        return;
+    }
+    if (S.cfg.rasterOutput.empty()) {
+        message(L"VEGA print packets are still unverified. Use Check plotter for USB diagnostics or configure RasterOutput to export PBM files.",
+                L"VEGA printing", MB_ICONINFORMATION);
         return;
     }
     std::optional<double> width = paperUnits();
@@ -1247,6 +1297,8 @@ void startPrint() {
     std::unique_ptr<ThreadArg> a(new ThreadArg);
     a->cfg = S.cfg;
     a->hwnd = S.hwnd;
+    a->paperWidth = *width;
+    a->calibration = S.calibration;
     std::wstring problems;
     for (int i = first; i < static_cast<int>(S.layers.size()); ++i) {
         Layer& l = S.layers[static_cast<size_t>(i)];
@@ -1270,7 +1322,12 @@ void startPrint() {
             l.status = L"queued";
             Job j;
             j.index = i;
-            j.bytes = std::move(plan.bytes);
+            j.piece = std::move(placed[0]);
+            j.stream = std::move(st);
+            j.plan = std::move(plan);
+            auto output = std::filesystem::path(S.cfg.rasterOutput) / baseName(l.path);
+            output += L".pbm";
+            j.path = output.wstring();
             a->jobs.push_back(std::move(j));
         } catch (const std::exception& e) {
             l.status = L"error";
@@ -1289,7 +1346,7 @@ void startPrint() {
     }
     g_stop = false;
     setRunning(true);
-    setStatus(L"Connecting...", false);
+    setStatus(L"Preparing raster export...", false);
     rebuildView();
     S.thread = CreateThread(nullptr, 0, printThread, a.get(), 0, nullptr);
     if (S.thread) {
@@ -1374,9 +1431,9 @@ void createControls(HWND hwnd) {
     S.editTo = addEdit(hwnd, ID_TO, 52, dp(22));
 
     S.btnCalibrate = addButton(hwnd, ID_CALIBRATE, L"Calibrate", 74, dp(22), false);
-    S.btnStart = addButton(hwnd, ID_START, L"Start", 40, dp(4), true);
+    S.btnStart = addButton(hwnd, ID_START, L"Export raster", 40, dp(4), true);
     S.btnStop = addButton(hwnd, ID_STOP, L"Stop", 40, 0, false);
-    S.btnTestUsb = addButton(hwnd, ID_TEST_USB, L"Test USB", 70, 0, false);
+    S.btnTestUsb = addButton(hwnd, ID_TEST_USB, L"Check plotter", 70, 0, false);
     EnableWindow(S.btnStop, FALSE);
 
     int largest = 0;
@@ -1631,7 +1688,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             l.status = std::to_wstring(l.pct) + L"%";
             invalidateRow(static_cast<int>(i));
             if (!g_stop) {
-                setStatus((S.cfg.dryRun.empty() ? L"Sending " : L"Saving ") + baseName(l.path) +
+                setStatus(std::wstring(L"Rendering ") + baseName(l.path) +
                           L" — " + std::to_wstring(l.pct) + L"%", false);
             }
             if (static_cast<int>(i) == S.shown) {
@@ -1648,8 +1705,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (lParam == 0) {
                 l.pct = 100;
                 l.sent = l.total;
-                l.status = S.cfg.dryRun.empty() ? L"sent" : L"saved";
-                setStatus((S.cfg.dryRun.empty() ? L"Sent " : L"Saved ") + baseName(l.path), false);
+                l.status = L"raster saved";
+                setStatus(std::wstring(L"Saved raster for ") + baseName(l.path), false);
             } else if (lParam == 1) {
                 l.status = L"stopped " + std::to_wstring(l.pct) + L"%";
                 setStatus(L"Stopped " + baseName(l.path) + L" at " + std::to_wstring(l.pct) + L"%", false);
@@ -1669,13 +1726,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case kMsgUsbResult: {
             std::unique_ptr<std::string> result(reinterpret_cast<std::string*>(lParam));
-            setStatus((wParam ? L"USB test passed: " : L"USB test failed: ") + wide(*result), !wParam);
+            setStatus((wParam ? L"Plotter check passed: " : L"Plotter check failed: ") + wide(*result), !wParam);
             return 0;
         }
-        case kMsgTransportOpen:
-            S.transportOpen = true;
-            updateUsbStatus();
-            return 0;
         case kMsgFinished:
             if (S.thread != nullptr) {
                 WaitForSingleObject(S.thread, 2000);
@@ -1690,7 +1743,6 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             }
             setRunning(false);
-            S.transportOpen = false;
             updateUsbStatus();
             showStatus();
             return 0;

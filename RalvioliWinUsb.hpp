@@ -42,6 +42,8 @@ struct WinUsbTransport : Transport {
     HANDLE device = INVALID_HANDLE_VALUE;
     WINUSB_INTERFACE_HANDLE usb = nullptr;
     UCHAR pipe = 0;
+    UCHAR pipeIn = 0;
+    int forceIn = 0x81;
     std::string info;
 
     WinUsbTransport(UINT v, UINT p, int endpoint, int timeout)
@@ -118,6 +120,7 @@ struct WinUsbTransport : Transport {
         snprintf(line, sizeof(line), "WinUSB interface %u", iface.bInterfaceNumber);
         info = line;
         pipe = 0;
+        pipeIn = 0;
         for (UCHAR index = 0; index < iface.bNumEndpoints; ++index) {
             WINUSB_PIPE_INFORMATION endpoint{};
             if (!WinUsb_QueryPipe(usb, 0, index, &endpoint) || endpoint.PipeType != UsbdPipeTypeBulk) {
@@ -126,15 +129,19 @@ struct WinUsbTransport : Transport {
             snprintf(line, sizeof(line), "; bulk %s 0x%02X (%u bytes)",
                      endpoint.PipeId & 0x80 ? "IN" : "OUT", endpoint.PipeId, endpoint.MaximumPacketSize);
             info += line;
+            if ((endpoint.PipeId & 0x80) && !pipeIn && (forceIn < 0 || endpoint.PipeId == forceIn)) {
+                pipeIn = endpoint.PipeId;
+            }
             if (!(endpoint.PipeId & 0x80) && (forcePipe < 0 || endpoint.PipeId == forcePipe) && !pipe) {
                 pipe = endpoint.PipeId;
             }
         }
-        if (!pipe) {
-            err = "No matching bulk OUT endpoint (" + info + ")";
+        if (!pipe || !pipeIn) {
+            err = "Missing matching bulk OUT or IN endpoint (" + info + ")";
             return false;
         }
-        if (!WinUsb_SetPipePolicy(usb, pipe, PIPE_TRANSFER_TIMEOUT, sizeof(timeoutMs), &timeoutMs)) {
+        if (!WinUsb_SetPipePolicy(usb, pipe, PIPE_TRANSFER_TIMEOUT, sizeof(timeoutMs), &timeoutMs) ||
+            !WinUsb_SetPipePolicy(usb, pipeIn, PIPE_TRANSFER_TIMEOUT, sizeof(timeoutMs), &timeoutMs)) {
             err = "WinUSB could not set the transfer timeout: " + winErrorText(GetLastError());
             return false;
         }
@@ -158,6 +165,14 @@ struct WinUsbTransport : Transport {
         }
         // Without a device acknowledgment, retrying a failed transfer could duplicate data.
         return -1;
+    }
+
+    bool read(unsigned char* data, size_t size, size_t& done, std::string& err) override {
+        ULONG transferred = 0;
+        const BOOL ok = WinUsb_ReadPipe(usb, pipeIn, data, static_cast<ULONG>(size), &transferred, nullptr);
+        done = transferred;
+        if (!ok) err = "WinUSB read failed: " + winErrorText(GetLastError());
+        return ok != FALSE;
     }
 
     void close() override {

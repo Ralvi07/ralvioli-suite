@@ -1,6 +1,6 @@
 // Defines the plotter transport contract and implements file and legacy libusbK backends.
 #pragma once
-// Transport interface and legacy libusbK and dry-run backends.
+// Transport interface and legacy libusbK backend.
 // Include after <windows.h>.
 
 #include <cstdio>
@@ -12,6 +12,7 @@ struct Transport {
     virtual std::string description() const { return {}; }
     // 0 = ok, 1 = timeout (done may be partial), -1 = error
     virtual int write(const unsigned char* p, size_t n, size_t& done, std::string& err) = 0;
+    virtual bool read(unsigned char* p, size_t n, size_t& done, std::string& err) = 0;
     virtual void close() {}
 };
 
@@ -35,35 +36,6 @@ inline std::string winErrorText(DWORD e) {
     snprintf(num, sizeof(num), " (Win32 %lu)", static_cast<unsigned long>(e));
     return (s.empty() ? std::string("error") : s) + num;
 }
-
-struct FileTransport : Transport {
-    std::wstring path;
-    FILE* f = nullptr;
-    explicit FileTransport(const std::wstring& p) : path(p) {}
-    ~FileTransport() override { close(); }
-    bool open(std::string& err) override {
-        f = _wfopen(path.c_str(), L"wb");
-        if (f == nullptr) {
-            err = "The test file could not be written";
-        }
-        return f != nullptr;
-    }
-    int write(const unsigned char* p, size_t n, size_t& done, std::string& err) override {
-        done = fwrite(p, 1, n, f);
-        if (done != n || fflush(f) != 0) {
-            err = "Could not write the dry-run output file.";
-            return -1;
-        }
-        Sleep(5);
-        return 0;
-    }
-    void close() override {
-        if (f != nullptr) {
-            fclose(f);
-        }
-        f = nullptr;
-    }
-};
 
 #pragma pack(push, 1)
 struct UsbIfDesc {
@@ -99,6 +71,8 @@ struct LibUsbKTransport : Transport {
     void* dev = nullptr;
     void* h = nullptr;
     UCHAR pipe = 0;
+    UCHAR pipeIn = 0;
+    int forceIn = 0x81;
     LstInitFn lstInit = nullptr;
     LstFreeFn lstFree = nullptr;
     LstFindFn lstFind = nullptr;
@@ -107,6 +81,7 @@ struct LibUsbKTransport : Transport {
     QueryIfFn queryIf = nullptr;
     QueryPipeFn queryPipe = nullptr;
     WriteFn writePipe = nullptr;
+    WriteFn readPipe = nullptr;
     PolicyFn setPolicy = nullptr;
     ResetFn resetPipe = nullptr;
     std::string info;
@@ -125,7 +100,7 @@ struct LibUsbKTransport : Transport {
     }
 
     bool open(std::string& err) override {
-        dll = LoadLibraryW(L"libusbK.dll");
+        dll = LoadLibraryExW(L"libusbK.dll", nullptr, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (dll == nullptr) {
             err = "libusbK.dll was not found next to the program";
             return false;
@@ -134,7 +109,7 @@ struct LibUsbKTransport : Transport {
             !load(lstFind, "LstK_FindByVidPid", err) || !load(usbInit, "UsbK_Init", err) ||
             !load(usbFree, "UsbK_Free", err) || !load(queryIf, "UsbK_QueryInterfaceSettings", err) ||
             !load(queryPipe, "UsbK_QueryPipe", err) || !load(writePipe, "UsbK_WritePipe", err) ||
-            !load(setPolicy, "UsbK_SetPipePolicy", err) || !load(resetPipe, "UsbK_ResetPipe", err)) {
+            !load(readPipe, "UsbK_ReadPipe", err) || !load(setPolicy, "UsbK_SetPipePolicy", err) || !load(resetPipe, "UsbK_ResetPipe", err)) {
             return false;
         }
         if (!lstInit(&list, 0)) {
@@ -167,18 +142,22 @@ struct LibUsbKTransport : Transport {
             }
             snprintf(line, sizeof(line), "; pipe 0x%02X type %d max %u", pi.id, pi.type, pi.maxPacket);
             info += line;
+            if (pi.type == 2 && (pi.id & 0x80) && !pipeIn && (forceIn < 0 || forceIn == pi.id)) {
+                pipeIn = pi.id;
+            }
             if (pi.type == 2 && (pi.id & 0x80) == 0 && found < 0 &&
                 (forcePipe < 0 || forcePipe == pi.id)) {
                 found = pi.id;
             }
         }
-        if (found < 0) {
-            err = "No bulk OUT endpoint found (" + info + ")";
+        if (found < 0 || !pipeIn) {
+            err = "Missing matching bulk OUT or IN endpoint (" + info + ")";
             return false;
         }
         pipe = static_cast<UCHAR>(found);
         UINT tmo = static_cast<UINT>(timeoutMs);
-        if (!setPolicy(h, pipe, 0x03, sizeof(tmo), &tmo)) {
+        if (!setPolicy(h, pipe, 0x03, sizeof(tmo), &tmo) ||
+            !setPolicy(h, pipeIn, 0x03, sizeof(tmo), &tmo)) {
             err = "libusbK could not set the transfer timeout: " + winErrorText(GetLastError());
             return false;
         }
@@ -200,6 +179,14 @@ struct LibUsbKTransport : Transport {
         resetPipe(h, pipe);
         err = "libusbK transfer failed: " + winErrorText(e);
         return -1;
+    }
+
+    bool read(unsigned char* p, size_t n, size_t& done, std::string& err) override {
+        UINT got = 0;
+        const BOOL ok = readPipe(h, pipeIn, p, static_cast<UINT>(n), &got, nullptr);
+        done = got;
+        if (!ok) err = "libusbK read failed: " + winErrorText(GetLastError());
+        return ok != FALSE;
     }
 
     void close() override {

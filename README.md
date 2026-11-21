@@ -4,7 +4,7 @@ Three native x64 Windows tools for HP-GL plot files.
 
 - **Merger** places, rotates, and combines files within a specified paper width.
 - **Viewer** previews, rotates, and crops files.
-- **Plotter** prepares a print queue, applies paper calibration, and sends HP-GL/2 over USB. The status bar reports Windows USB detection, transfer progress, and errors. This one is work in progress still and the compatibility for other algotex plotter is not guaranteed
+- **Plotter** queues HP-GL files, renders calibrated monochrome raster previews, and checks communication with an Algotex VEGA.
 
 ## Download
 
@@ -21,10 +21,10 @@ Set `MSYS2_UCRT64_BIN` or `ISCC` first if your tools are in custom locations.
 
 ## Plotter
 
-The default backend uses WinUSB for Algotex USB device `135D:F001`. Configure the Windows USB driver binding separately.
+The default backend uses WinUSB for Algotex USB device `135D:F001`. Configure the Windows USB driver binding separately. The legacy libusbK backend requires the corresponding driver and an x64 libusbK DLL.
 
-**Test USB** checks whether the app can open the plotter interface and reports its endpoints. Use **Calibrate** to enter expected and measured lengths for the feed and across-paper axes.
+**Check plotter** sends the legacy status request and verifies the acknowledgment, reply header and checksum. It logs the endpoints and returned bytes alongside the active INI as `Ralvioli Plotter.usb.txt`. The legacy OCX encodes the status payload as `00 1A` (calls at `0x1000f746` and `0x1001a0c7`) and uses bulk OUT `0x01` and IN `0x81` (calls at `0x1001b2c0` and `0x1001b303`).
 
-Plotter settings are stored in `%LOCALAPPDATA%\Ralvioli Suite\Ralvioli Plotter.ini` by default. A copy of `RalvioliPlotter.ini` named `Ralvioli Plotter.ini` alongside a portable build takes precedence. The sample INI also shows the dry-run and legacy libusbK options.
+**Export raster** writes one PBM per queued file to the existing folder configured in `RasterOutput`. The output uses the selected data step, header option, range, paper width, and calibration. The default 300 dpi is for raster inspection. VEGA printing still requires the print-job handshake and raster encoding to be verified on a working device session.
 
-The status bar tracks USB detection and byte transfers and displays Windows error codes when available. VEGA printing and printer-reported conditions such as paper and ink errors still require verification against a working Algotex USB session.
+Plotter settings default to `%LOCALAPPDATA%\Ralvioli Suite\Ralvioli Plotter.ini`. For a portable build, place the sample `RalvioliPlotter.ini` next to the executable as `Ralvioli Plotter.ini`. If no INI sets `RasterOutput`, raster export is unavailable.
