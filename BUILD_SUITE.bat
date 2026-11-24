@@ -16,7 +16,7 @@ if not exist "%ISCC%" (
 if not exist build mkdir build || exit /b 1
 set "FLAGS=-std=c++17 -O2 -s -DUNICODE -D_UNICODE -mwindows -static -static-libgcc -static-libstdc++"
 set "LIBS=-lcomdlg32 -lgdi32 -lcomctl32 -luser32"
-call :build Merger "" || exit /b 1
+call :build Merger "-lshell32" || exit /b 1
 call :build Viewer "-lshell32" || exit /b 1
 call :build Plotter "-lsetupapi -lwinusb -lshell32" || exit /b 1
 "%ISCC%" RalvioliSuite_installer.iss || exit /b 1

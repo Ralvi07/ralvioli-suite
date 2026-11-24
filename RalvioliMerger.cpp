@@ -18,6 +18,7 @@
 
 #include "RalvioliCore.hpp"
 #include "PreviewNavigation.hpp"
+#include "DroppedFiles.hpp"
 
 namespace {
 
@@ -629,6 +630,7 @@ int hitPreviewArrow(POINT mouse) {
 }
 
 LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DROPFILES) return SendMessageW(S.hwnd, msg, wParam, lParam);
     switch (msg) {
         case WM_ERASEBKGND:
             return 1;
@@ -762,8 +764,7 @@ std::vector<std::wstring> pickFiles() {
     return files;
 }
 
-void addFiles() {
-    std::vector<std::wstring> files = pickFiles();
+void addFiles(const std::vector<std::wstring>& files) {
     if (files.empty()) {
         return;
     }
@@ -1065,6 +1066,7 @@ void drawChip(HDC dc, const RECT& chip, const wchar_t* text, bool sel, bool arro
 }
 
 LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DROPFILES) return SendMessageW(S.hwnd, msg, wParam, lParam);
     if (msg == WM_LBUTTONDOWN) {
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
@@ -1193,7 +1195,16 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CREATE:
             S.hwnd = hwnd;
             createControls(hwnd);
+            DragAcceptFiles(hwnd, TRUE);
+            DragAcceptFiles(S.list, TRUE);
+            DragAcceptFiles(S.preview, TRUE);
             return 0;
+        case WM_DROPFILES: {
+            // Drops on either pane use the same placement and refresh as Add files.
+            const shell::DroppedFiles files(reinterpret_cast<HDROP>(wParam));
+            addFiles(files.paths());
+            return 0;
+        }
         case WM_SIZE:
             if (S.preview) {
                 layoutAll(LOWORD(lParam), HIWORD(lParam));
@@ -1258,7 +1269,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
                 case ID_ADD:
-                    addFiles();
+                    addFiles(pickFiles());
                     break;
                 case ID_REMOVE:
                     removeSelected();

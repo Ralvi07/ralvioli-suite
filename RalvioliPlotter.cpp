@@ -22,6 +22,7 @@
 
 #include "RalvioliCore.hpp"
 #include "PreviewNavigation.hpp"
+#include "DroppedFiles.hpp"
 #include "PlotStream.hpp"
 #include "RalvioliUsb.hpp"
 #include "RalvioliWinUsb.hpp"
@@ -1231,25 +1232,9 @@ void addFiles(const std::vector<std::wstring>& files) {
 }
 
 void addDroppedFiles(HDROP drop) {
-    struct DropHandle {
-        HDROP handle;
-        ~DropHandle() { DragFinish(handle); }
-    } owned{drop};
+    const shell::DroppedFiles owned(drop);
     if (S.running) return;
-
-    std::vector<std::wstring> files;
-    const UINT count = DragQueryFileW(drop, 0xffffffffu, nullptr, 0);
-    files.reserve(count);
-    for (UINT i = 0; i < count; ++i) {
-        const UINT length = DragQueryFileW(drop, i, nullptr, 0);
-        if (!length) continue;
-        std::wstring path(length + 1, L'\0');
-        if (DragQueryFileW(drop, i, path.data(), length + 1) != length) continue;
-        path.resize(length);
-        const DWORD attributes = GetFileAttributesW(path.c_str());
-        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
-            files.push_back(std::move(path));
-    }
+    const auto files = owned.paths();
     if (!files.empty()) addFiles(files);
     else setStatus(L"Drop one or more plot files into the queue.", true);
 }
