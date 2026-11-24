@@ -30,10 +30,19 @@ Name: "plotter"; Description: "Ralvioli Plotter"; Types: full custom
 [Tasks]
 Name: "desktopicons"; Description: "Create desktop shortcuts"; Flags: unchecked; Components: merger or viewer or plotter
 
+Name: "algotexdriver"; Description: "Install the Algotex VEGA USB driver"; Flags: unchecked; Components: plotter
+
 [Files]
 Source: "build\Ralvioli Merger.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: merger
 Source: "build\Ralvioli Viewer.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: viewer
 Source: "build\Ralvioli Plotter.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: plotter
+
+Source: "drivers\Algotex_USB_Plotter\libusbK.dll"; DestDir: "{app}"; Flags: ignoreversion; Components: plotter
+Source: "drivers\Algotex_USB_Plotter\InstallDriver.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Components: plotter; Tasks: algotexdriver
+
+[Run]
+; Run the supplied installer with its normal driver wizard and wait for it to finish.
+Filename: "{tmp}\InstallDriver.exe"; StatusMsg: "Installing the Algotex VEGA USB driver..."; Flags: waituntilterminated; Components: plotter; Tasks: algotexdriver
 
 [Icons]
 Name: "{group}\Ralvioli Merger"; Filename: "{app}\Ralvioli Merger.exe"; Components: merger
