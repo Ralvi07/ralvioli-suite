@@ -5,6 +5,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <stdio.h>
 
 #include <algorithm>
@@ -20,12 +21,14 @@
 #include <vector>
 
 #include "RalvioliCore.hpp"
+#include "PreviewNavigation.hpp"
 #include "PlotStream.hpp"
 #include "RalvioliUsb.hpp"
 #include "RalvioliWinUsb.hpp"
 #include "PlotterResource.h"
 #include "PlotPrint.hpp"
 #include "Protocol.hpp"
+#include "VegaRender.hpp"
 #include <filesystem>
 
 namespace {
@@ -39,12 +42,16 @@ enum {
     ID_FIT,
     ID_FROM,
     ID_TO,
-    ID_CALIBRATE,
-    ID_START,
+    ID_START = ID_TO + 2,
     ID_STOP,
     ID_TEST_USB,
+    ID_SERVER_CONFIG,
     ID_LIST,
-    ID_STATUS
+    ID_STATUS,
+    ID_PRINT_AUTO,
+    ID_CLEAN_HEADS,
+    ID_ADVANCE_PAPER,
+    ID_PAUSE
 };
 
 const UINT kMsgProg = WM_APP + 1;      // wParam layer, lParam bytes sent
@@ -52,6 +59,10 @@ const UINT kMsgDone = WM_APP + 2;      // wParam layer, lParam 0 done / 1 stoppe
 const UINT kMsgError = WM_APP + 3;     // lParam new std::string*
 const UINT kMsgFinished = WM_APP + 4;
 const UINT kMsgUsbResult = WM_APP + 5;
+const UINT kMsgVegaRecovery = WM_APP + 6;
+const UINT kMsgPrintStatus = WM_APP + 7;
+const UINT kMsgHeadCleanDone = WM_APP + 8;
+const UINT kMsgPauseState = WM_APP + 9;
 const UINT_PTR kUsbStatusTimer = 1;
 
 const COLORREF kColors[] = {RGB(0x15, 0x65, 0xc0), RGB(0xc6, 0x28, 0x28), RGB(0x2e, 0x7d, 0x32),
@@ -79,6 +90,14 @@ struct Layer {
     size_t total = 0;
 };
 
+struct QueueDrawing {
+    size_t index;
+    std::vector<rp::DItem> items;
+    double offset;
+    double first;
+    double last;
+};
+
 struct Slot {
     HWND hwnd;
     int width;
@@ -94,10 +113,17 @@ struct Settings {
     int pipe = 1;
     int pipeIn = 129;
     double lineWidthMm = 0.4;
+    double rightMarginMm = 55;
+    double spacingMm = 10;
+    int shift = 0;
+    int rotation = 0;
+    bool bidi = false;
     int timeoutMs = 2000;
-    bool libusbK = false;
+    std::wstring backend;
     std::wstring ini;
 };
+
+struct ThreadArg;
 
 struct State {
     HINSTANCE inst = nullptr;
@@ -109,13 +135,26 @@ struct State {
     HWND editTo = nullptr;
     HWND status = nullptr;
     HWND usbStatus = nullptr;
-    HWND btnCalibrate = nullptr;
+    HWND totalLength = nullptr;
     HWND calibrationWindow = nullptr;
     HWND btnAdd = nullptr;
     HWND btnRemove = nullptr;
     HWND btnStart = nullptr;
+    HWND printAuto = nullptr;
+    HWND btnAdvancePaper = nullptr;
+    HWND btnPause = nullptr;
+    HWND btnCleanHeads = nullptr;
+    bool maintenanceRunning = false;
     HWND btnStop = nullptr;
     HWND btnTestUsb = nullptr;
+    HWND btnServerConfig = nullptr;
+    HWND indicators[7]{};
+    HANDLE connectionThread = nullptr;
+    std::unique_ptr<ThreadArg> pendingPrint;
+    bool reconnectingAfterPrint = false;
+    HANDLE disconnect = nullptr;
+    int statusWord = -1;
+    bool recoveryRequired = false;
     cal::Factors calibration;
     HFONT font = nullptr;
     HFONT bold = nullptr;
@@ -130,8 +169,7 @@ struct State {
     int shown = -1;
     bool viewOk = false;
     std::optional<rm::Box> box;
-    rp::Stream stream;
-    rp::Plan plan;
+    std::vector<QueueDrawing> queueDrawings;
     std::vector<rp::DItem> items;
     std::string message;
     std::wstring statusText;
@@ -144,7 +182,9 @@ struct State {
     double vs = 1.0;
     int cw = 0;
     int ch = 0;
-    bool panning = false;
+    UINT panButton = 0;
+    int rangeDrag = 0;
+    int rangeDragOffset = 0;
     POINT panLast{0, 0};
     std::wstring lastDir;
     bool running = false;
@@ -153,6 +193,9 @@ struct State {
 
 State S;
 std::atomic<bool> g_stop(false);
+std::atomic<bool> g_pause(false);
+enum class MaintenanceAction { None, CleanHeads, AdvancePaper };
+std::atomic<MaintenanceAction> g_maintenance{MaintenanceAction::None};
 
 int dp(int v) {
     return MulDiv(v, S.dpi, 96);
@@ -248,7 +291,8 @@ std::optional<double> paperUnits() {
     if (end == t.c_str() || *end != L'\0' || !(cm > 0)) {
         return std::nullopt;
     }
-    return cm * rm::kUnitsPerCm;
+    if (!std::isfinite(cm)) return std::nullopt;
+    return std::max(0.0, cm - S.cfg.rightMarginMm / 10) * rm::kUnitsPerCm;
 }
 
 // ---------------------------------------------------------------- settings
@@ -293,7 +337,13 @@ void loadSettings() {
     S.cfg.pipeIn = GetPrivateProfileIntW(L"Plotter", L"PipeIn", 129, S.cfg.ini.c_str());
     S.cfg.lineWidthMm = std::clamp(positiveNumber(iniText(L"LineWidthMm", L"0.4")).value_or(0.4), 0.01, 5.0);
     S.cfg.timeoutMs = std::clamp(std::wcstol(iniText(L"TimeoutMs", L"2000").c_str(), nullptr, 10), 100L, 60000L);
-    S.cfg.libusbK = _wcsicmp(iniText(L"Backend", L"WinUSB").c_str(), L"libusbK") == 0;
+    S.cfg.backend = iniText(L"Backend", L"Auto");
+    S.cfg.rightMarginMm = std::max(0.0, std::wcstod(iniText(L"RightMarginMm", L"55").c_str(), nullptr));
+    S.cfg.spacingMm = std::max(0.0, std::wcstod(iniText(L"SpacingMm", L"10").c_str(), nullptr));
+    S.cfg.shift = static_cast<int>(GetPrivateProfileIntW(L"Plotter", L"ShiftMm", 0, S.cfg.ini.c_str()));
+    const UINT rotation = GetPrivateProfileIntW(L"Plotter", L"Rotation", 0, S.cfg.ini.c_str());
+    S.cfg.rotation = rotation == 90 || rotation == 180 ? rotation : 0;
+    S.cfg.bidi = GetPrivateProfileIntW(L"Plotter", L"Bidi", 0, S.cfg.ini.c_str()) != 0;
     std::wstring calibration = iniText(L"Calibration", L"1|1");
     size_t separator = calibration.find(L'|');
     if (separator != std::wstring::npos) {
@@ -334,16 +384,26 @@ void setStatus(const std::wstring& t, bool error) {
 void updateUsbStatus() {
     const wchar_t* text;
     switch (plotterUsbPresence(S.cfg.vid, S.cfg.pid)) {
-        case UsbPresence::Present: text = L"Printer: detected by Windows"; break;
+        case UsbPresence::Present: text = L"Algotex USB device detected"; break;
         case UsbPresence::Missing: text = L"Printer: USB device not detected"; break;
         default: text = L"Printer: USB status unavailable"; break;
     }
     SetWindowTextW(S.usbStatus, text);
 }
 
+double drawingRotation(const Layer& layer) {
+    if (S.cfg.rotation != 90) return S.cfg.rotation;
+    const auto width = paperUnits();
+    if (!width || *width <= 0) return 0;
+    const auto& piece = rm::loadRotated(S.cache, layer.path, 0, kUnitMm[layer.unit], layer.noHeader);
+    const auto box = rm::boxOf(piece.ops);
+    return box && box->y1 * S.calibration.across > *width &&
+                   (box->x1 - box->x0) * S.calibration.across <= *width ? 90 : 0;
+}
+
 std::optional<rm::Box> layerBox(const Layer& l, std::string& error) {
     try {
-        const rm::Piece& piece = rm::loadRotated(S.cache, l.path, 0.0, kUnitMm[l.unit], l.noHeader);
+        const rm::Piece& piece = rm::loadRotated(S.cache, l.path, drawingRotation(l), kUnitMm[l.unit], l.noHeader);
         std::optional<rm::Box> b = rm::boxOf(piece.ops);
         if (!b) {
             error = "Nothing to draw in this file.";
@@ -391,7 +451,28 @@ int selectedIndex() {
     return (i == LB_ERR || i >= static_cast<int>(S.layers.size())) ? -1 : i;
 }
 
+std::wstring formatLength(double units) {
+    wchar_t text[48];
+    std::swprintf(text, std::size(text), L"%.2f m", units * S.calibration.feed * (kHpglOutputStepMm / 1000));
+    return text;
+}
+
+double selectedLength(size_t index) {
+    if (index >= S.layers.size() || index >= S.boxes.size() || !S.boxes[index]) return 0;
+    const auto& layer = S.layers[index];
+    if (layer.to <= layer.from) return 0;
+    const auto range = vega::feedRange(*S.boxes[index], S.calibration.feed, layer.from, layer.to);
+    return std::max(0.0, range.last - range.first);
+}
+
+void updateTotalLength() {
+    double total = 0;
+    for (size_t i = 0; i < S.layers.size(); ++i) total += selectedLength(i);
+    SetWindowTextW(S.totalLength, (L"Total length  " + formatLength(total)).c_str());
+}
+
 void showStatus() {
+    updateTotalLength();
     if (S.running) {
         return;
     }
@@ -432,68 +513,81 @@ void invalidateRow(int i) {
 }
 
 // ---------------------------------------------------------------- preview data
+bool showingQueue() {
+    return SendMessageW(S.printAuto, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
 void rebuildView() {
     S.items.clear();
-    S.plan = rp::Plan();
-    S.stream = rp::Stream();
+    S.queueDrawings.clear();
     S.box.reset();
     S.viewOk = false;
     S.message.clear();
     S.shown = selectedIndex();
-    if (S.shown >= 0) {
-        const Layer& l = S.layers[static_cast<size_t>(S.shown)];
+    const bool queue = showingQueue();
+    // Lay out the selected band ranges in feed order, including paper spacing.
+    double nextStart = 0;
+    for (size_t i = 0; i < S.layers.size(); ++i) {
+        if (!queue && static_cast<int>(i) != S.shown) continue;
+        const Layer& layer = S.layers[i];
+        if (queue && (layer.status == L"done" || layer.to <= layer.from)) continue;
         try {
-            rm::Req q;
-            q.path = l.path;
-            q.unit = kUnitMm[l.unit];
-            q.noHeader = l.noHeader;
-            std::vector<rm::Piece> placed = rm::placeLayers(S.cache, {q}, paperUnits());
-            const rm::Piece& piece = placed[0];
-            S.box = rm::boxOf(piece.ops);
-            if (S.box) {
-                S.box->x0 *= S.calibration.feed;
-                S.box->x1 *= S.calibration.feed;
-                S.box->y0 *= S.calibration.across;
-                S.box->y1 *= S.calibration.across;
+            const rm::Req request{layer.path, drawingRotation(layer), kUnitMm[layer.unit], layer.noHeader};
+            const auto placed = rm::placeLayers(S.cache, {request}, paperUnits());
+            const rm::Piece& piece = placed.front();
+            const auto box = rm::boxOf(piece.ops);
+            const auto stream = rp::makeStream(piece, kHpglOutputStepMm, S.calibration);
+            auto items = rp::buildDrawing(piece, stream);
+            if (!box || items.empty()) continue;
+            const double low = box->y0 * S.calibration.across;
+            const double high = box->y1 * S.calibration.across;
+            if (queue) {
+                const auto range = vega::feedRange(*box, S.calibration.feed, layer.from, layer.to);
+                if (range.last <= range.first) continue;
+                const double offset = nextStart - range.first * S.calibration.feed;
+                const double end = offset + range.last * S.calibration.feed;
+                if (S.box) {
+                    S.box->x1 = end;
+                    S.box->y0 = std::min(S.box->y0, low);
+                    S.box->y1 = std::max(S.box->y1, high);
+                } else {
+                    S.box = rm::Box{nextStart, low, end, high};
+                }
+                S.queueDrawings.push_back({i, std::move(items), offset, nextStart, end});
+                nextStart = end + S.cfg.spacingMm / kHpglOutputStepMm;
+            } else {
+                S.box = rm::Box{box->x0 * S.calibration.feed, low, box->x1 * S.calibration.feed, high};
+                S.items = std::move(items);
             }
-            S.stream = rp::makeStream(piece, kHpglOutputStepMm, S.calibration);
-            S.plan = rp::makePlan(S.stream, l.from, l.to);
-            S.items = rp::buildDrawing(piece, S.stream);
-            S.viewOk = S.box.has_value() && !S.items.empty();
-            if (!S.viewOk) {
-                S.message = "Nothing to draw in this file.";
-            }
-        } catch (const rm::HpglError& e) {
-            S.message = std::string("Cannot show this file:\n") + e.what();
         } catch (const std::exception& e) {
-            S.message = std::string("Cannot show this file: ") + e.what();
+            S.message = std::string("Cannot show file ") + std::to_string(i + 1) + ": " + e.what();
         }
         rm::warnings().clear();
     }
+    S.viewOk = S.box.has_value();
+    if (!S.viewOk && S.message.empty() && !S.layers.empty())
+        S.message = queue ? "No printable ranges in the queue." : "Nothing to draw in this file.";
     InvalidateRect(S.preview, nullptr, FALSE);
     showStatus();
 }
 
+double fittedScale() {
+    const double width = S.box->x1 - S.box->x0;
+    const double height = S.box->y1 - S.box->y0;
+    const int margin = dp(10);
+    return clampScale(std::min((S.cw - 2 * margin) / std::max(width * 1.06 + 2, 1.0),
+                               (S.ch - 2 * margin - bottomPad()) / std::max(height * 1.10 + 2, 1.0)));
+}
+
 void fitView() {
-    if (!S.box) {
-        return;
-    }
-    double minx = S.box->x0;
-    double miny = S.box->y0;
-    double maxx = S.box->x1;
-    double maxy = S.box->y1;
-    double padx = (maxx - minx) * 0.03 + 1;
-    double pady = (maxy - miny) * 0.05 + 1;
-    minx -= padx;
-    miny -= pady;
-    maxx += padx;
-    maxy += pady;
-    double m = dp(10);
-    double sc = std::min((S.cw - 2 * m) / std::max(maxx - minx, 1.0),
-                         (S.ch - 2 * m - bottomPad()) / std::max(maxy - miny, 1.0));
-    S.vx = minx;
-    S.vy = miny;
-    S.vs = clampScale(sc);
+    if (!S.box) return;
+    S.vx = S.box->x0 - ((S.box->x1 - S.box->x0) * 0.03 + 1);
+    S.vy = S.box->y0 - ((S.box->y1 - S.box->y0) * 0.05 + 1);
+    S.vs = fittedScale();
+}
+
+bool previewZoomed() {
+    return S.viewOk && S.box && !S.autoFit && S.vs > fittedScale() * 1.001;
 }
 
 void ensureView() {
@@ -540,19 +634,18 @@ void fitAll() {
     InvalidateRect(S.preview, nullptr, FALSE);
 }
 
-void startPan(int x, int y) {
+void startPan(int x, int y, UINT button) {
     ensureView();
-    if (!S.viewOk) {
-        return;
-    }
+    if (!S.viewOk || S.rangeDrag || S.panButton) return;
     S.autoFit = false;
-    S.panning = true;
+    S.panButton = button;
+    KillTimer(S.preview, preview::hoverTimer);
     S.panLast = POINT{x, y};
     SetCapture(S.preview);
 }
 
 void onMove(int x, int y) {
-    if (S.panning) {
+    if (S.panButton) {
         S.vx -= (x - S.panLast.x) / S.vs;
         S.vy += (y - S.panLast.y) / S.vs;
         S.panLast = POINT{x, y};
@@ -573,6 +666,7 @@ struct Job {
     rp::Stream stream;
     rp::Plan plan;
     std::wstring title;
+    std::optional<vega::FeedRange> range;
 };
 
 bool startWindowsPrint(HWND owner, std::vector<Job> jobs, double paperWidth, cal::Factors factors);
@@ -702,12 +796,12 @@ INT_PTR CALLBACK calibrationDialog(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return TRUE;
 }
 
-void showCalibration() {
+void showCalibration(HWND owner) {
     if (S.running) {
         return;
     }
     cal::Factors factors = S.calibration;
-    INT_PTR result = DialogBoxParamW(S.inst, MAKEINTRESOURCEW(IDD_CALIBRATION), S.hwnd,
+    INT_PTR result = DialogBoxParamW(S.inst, MAKEINTRESOURCEW(IDD_CALIBRATION), owner,
                                     calibrationDialog, reinterpret_cast<LPARAM>(&factors));
     if (result == -1) {
         message(L"Could not open the calibration dialog.", L"Paper calibration", MB_ICONERROR);
@@ -718,9 +812,60 @@ void showCalibration() {
             return;
         }
         S.calibration = factors;
+        for (size_t i = 0; i < S.layers.size(); ++i) computeBox(i);
+        InvalidateRect(S.list, nullptr, FALSE);
         rebuildView();
         fitAll();
     }
+}
+
+rm::Box previewFeedBox() {
+    const auto& box = *S.box;
+    return {box.x0 / S.calibration.feed, box.y0, box.x1 / S.calibration.feed, box.y1};
+}
+
+int rangeMarkerX(double feed) {
+    return clampInt(dp(10) + (feed * S.calibration.feed - S.vx) * S.vs);
+}
+
+RECT rangeHandle(int marker, int x) {
+    const int y = dp(marker == 1 ? 42 : 64);
+    return {x - dp(7), y, x + dp(7), y + dp(18)};
+}
+
+int hitRangeHandle(POINT mouse) {
+    ensureView();
+    if (showingQueue() || S.running || !S.viewOk || !S.box || S.shown < 0) return 0;
+    const auto& layer = S.layers[static_cast<size_t>(S.shown)];
+    const auto box = previewFeedBox();
+    if (box.x1 <= box.x0) return 0;
+    const auto range = vega::feedRange(box, S.calibration.feed, layer.from, layer.to);
+    const RECT from = rangeHandle(1, rangeMarkerX(range.first));
+    const RECT to = rangeHandle(2, rangeMarkerX(range.last));
+    if (PtInRect(&from, mouse)) return 1;
+    if (PtInRect(&to, mouse)) return 2;
+    return 0;
+}
+
+void dragRangeHandle(int mouseX) {
+    if (S.running || !S.box || S.shown < 0) return;
+    auto& layer = S.layers[static_cast<size_t>(S.shown)];
+    const auto box = previewFeedBox();
+    const double span = box.x1 - box.x0;
+    if (span <= 0) return;
+    const double feed = (S.vx + (mouseX - S.rangeDragOffset - dp(10)) / S.vs) / S.calibration.feed;
+    const double requested = std::clamp(100 * (feed - box.x0) / span, 0.0, 100.0);
+    const double edge = requested == 100 ? box.x1 :
+        vega::feedRange(box, S.calibration.feed, requested, requested).first;
+    const double snapped = std::clamp(100 * (edge - box.x0) / span, 0.0, 100.0);
+    double& value = S.rangeDrag == 1 ? layer.from : layer.to;
+    value = S.rangeDrag == 1 ? std::min(snapped, layer.to) : std::max(snapped, layer.from);
+    S.updating = true;
+    SetWindowTextW(S.rangeDrag == 1 ? S.editFrom : S.editTo, wide(rm::num(value)).c_str());
+    S.updating = false;
+    invalidateRow(S.shown);
+    updateTotalLength();
+    InvalidateRect(S.preview, nullptr, FALSE);
 }
 
 void drawScene(HDC dc, int w, int h) {
@@ -741,7 +886,8 @@ void drawScene(HDC dc, int w, int h) {
     const int bp = bottomPad();
     auto X = [&](double x) { return clampInt(m + (x - S.vx) * sc); };
     auto Y = [&](double y) { return clampInt(h - m - bp - (y - S.vy) * sc); };
-    auto plotX = [&](double x) { return X(x * S.calibration.feed); };
+    double feedOffset = 0;
+    auto plotX = [&](double x) { return X(feedOffset + x * S.calibration.feed); };
     auto plotY = [&](double y) { return Y(y * S.calibration.across); };
 
     std::optional<double> pw = paperUnits();
@@ -763,86 +909,102 @@ void drawScene(HDC dc, int w, int h) {
         DeleteObject(dash);
     }
 
-    const Layer& layer = S.layers[static_cast<size_t>(S.shown)];
-    const size_t sent = layer.sent;
-    COLORREF color = kColors[static_cast<size_t>(S.shown) % kColorCount];
-    auto stateOf = [&](int ln) -> int {
-        if (ln < 0 || ln >= static_cast<int>(S.plan.lineIn.size()) || !S.plan.lineIn[static_cast<size_t>(ln)]) {
-            return 0;
-        }
-        return S.plan.lineEnd[static_cast<size_t>(ln)] <= sent ? 2 : 1;
-    };
-    HPEN pens[3] = {CreatePen(PS_SOLID, 1, kFaint), CreatePen(PS_SOLID, 1, color),
-                    CreatePen(PS_SOLID, dp(2), kInk)};
-    COLORREF cols[3] = {kFaint, color, kInk};
-    HGDIOBJ nullBrush = GetStockObject(NULL_BRUSH);
-    HGDIOBJ oldPen = SelectObject(dc, pens[1]);
-    HGDIOBJ oldBrush = SelectObject(dc, nullBrush);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    HGDIOBJ oldPen = GetCurrentObject(dc, OBJ_PEN);
     SetBkMode(dc, TRANSPARENT);
     SetTextAlign(dc, TA_BASELINE | TA_LEFT);
     std::map<std::pair<int, int>, HFONT> fonts;
     std::vector<POINT> run;
-
-    for (const rp::DItem& it : S.items) {
-        if (it.type == 0) {
-            run.clear();
-            int cur = -1;
-            for (size_t k = 0; k < it.pts.size(); ++k) {
-                POINT p{plotX(it.pts[k].x), plotY(it.pts[k].y)};
-                if (k == 0) {
-                    run.push_back(p);
-                    continue;
+    const auto drawRange = [&](const auto& items, int x0, int x1, COLORREF ink, int penWidth) {
+        if (x1 <= x0) return;
+        const int saved = SaveDC(dc);
+        if (!saved) return;
+        IntersectClipRect(dc, x0, 0, x1, h);
+        HPEN pen = CreatePen(PS_SOLID, penWidth, ink);
+        SelectObject(dc, pen);
+        SetTextColor(dc, ink);
+        for (const auto& item : items) {
+            if (item.type == 0) {
+                run.clear();
+                for (const auto& p : item.pts) run.push_back({plotX(p.x), plotY(p.y)});
+                if (run.size() > 1) Polyline(dc, run.data(), static_cast<int>(run.size()));
+            } else if (item.type == 1) {
+                const double r = item.r;
+                Ellipse(dc, plotX(item.c.x-r), plotY(item.c.y+r), plotX(item.c.x+r), plotY(item.c.y-r));
+            } else {
+                const int size = std::max(7, std::min(400, static_cast<int>(item.height * sc)));
+                const int angle = static_cast<int>(std::lround(std::atan2(item.dy, item.dx) * 1800 / 3.14159265358979323846));
+                const std::pair<int, int> key{size, angle};
+                auto found = fonts.find(key);
+                if (found == fonts.end()) {
+                    HFONT font = CreateFontW(-size, 0, angle, angle, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                             OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                    found = fonts.emplace(key, font).first;
                 }
-                int st = stateOf(it.ln[k]);
-                if (cur == -1) {
-                    cur = st;
-                } else if (st != cur) {
-                    if (run.size() > 1) {
-                        SelectObject(dc, pens[cur]);
-                        Polyline(dc, run.data(), static_cast<int>(run.size()));
-                    }
-                    POINT last = run.back();
-                    run.clear();
-                    run.push_back(last);
-                    cur = st;
-                }
-                run.push_back(p);
+                SelectObject(dc, found->second);
+                TextOutA(dc, plotX(item.c.x), plotY(item.c.y), item.text.c_str(), static_cast<int>(item.text.size()));
             }
-            if (run.size() > 1 && cur >= 0) {
-                SelectObject(dc, pens[cur]);
-                Polyline(dc, run.data(), static_cast<int>(run.size()));
-            }
-        } else if (it.type == 1) {
-            int st = stateOf(it.line);
-            SelectObject(dc, pens[st]);
-            double r = it.r;
-            Ellipse(dc, plotX(it.c.x - r), plotY(it.c.y + r), plotX(it.c.x + r), plotY(it.c.y - r));
-        } else {
-            int st = stateOf(it.line);
-            SetTextColor(dc, cols[st]);
-            int size = std::max(7, std::min(400, static_cast<int>(it.height * sc)));
-            int angle = static_cast<int>(std::lround(std::atan2(it.dy, it.dx) * 180.0 / 3.14159265358979323846 * 10.0));
-            std::pair<int, int> key{size, angle};
-            auto found = fonts.find(key);
-            if (found == fonts.end()) {
-                HFONT f = CreateFontW(-size, 0, angle, angle, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                      OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                                      DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-                found = fonts.emplace(key, f).first;
-            }
-            HGDIOBJ oldFont = SelectObject(dc, found->second);
-            TextOutA(dc, plotX(it.c.x), plotY(it.c.y), it.text.c_str(), static_cast<int>(it.text.size()));
-            SelectObject(dc, oldFont);
         }
+        RestoreDC(dc, saved);
+        DeleteObject(pen);
+    };
+    const auto restoreDrawing = [&] {
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        for (const auto& entry : fonts) DeleteObject(entry.second);
+    };
+    if (showingQueue()) {
+        for (const auto& drawing : S.queueDrawings) {
+            const Layer& layer = S.layers[drawing.index];
+            const int left = std::clamp(X(drawing.first), 0, w);
+            const int right = std::clamp(X(drawing.last) + 1, left, w);
+            const int printed = layer.pct >= 100 ? right : std::clamp(
+                X(drawing.first + (drawing.last - drawing.first) * layer.pct / 100.0), left, right);
+            feedOffset = drawing.offset;
+            drawRange(drawing.items, left, printed, kBarGreen, dp(2));
+            drawRange(drawing.items, printed, right, kColors[drawing.index % kColorCount], 1);
+        }
+        restoreDrawing();
+        return;
     }
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    for (HPEN p : pens) {
-        DeleteObject(p);
+
+    const Layer& layer = S.layers[static_cast<size_t>(S.shown)];
+    const COLORREF color = kColors[static_cast<size_t>(S.shown) % kColorCount];
+    const auto geometry = previewFeedBox();
+    const auto range = vega::feedRange(geometry, S.calibration.feed, layer.from, layer.to);
+    const int left = std::clamp(plotX(range.first), 0, w);
+    const int right = layer.to <= layer.from ? left : std::clamp(plotX(range.last), left, w);
+    const int printed = std::clamp(plotX(range.first + (range.last - range.first) * layer.pct / 100.0),
+                                   left, right);
+    const bool partial = layer.from > 0 || layer.to < 100;
+    drawRange(S.items, 0, partial ? left : 0, kFaint, 1);
+    drawRange(S.items, partial ? left : 0, printed, kBarGreen, dp(2));
+    drawRange(S.items, printed, partial ? right : w, color, 1);
+    drawRange(S.items, partial ? right : w, w, kFaint, 1);
+    HPEN guide = CreatePen(PS_DASH, 1, RGB(95, 102, 111));
+    HGDIOBJ previous = SelectObject(dc, guide);
+    for (const int x : {rangeMarkerX(range.first), rangeMarkerX(range.last)}) {
+        if (x < 0 || x >= w) continue;
+        MoveToEx(dc, x, 0, nullptr);
+        LineTo(dc, x, h - bp);
     }
-    for (auto& f : fonts) {
-        DeleteObject(f.second);
+    SelectObject(dc, previous);
+    DeleteObject(guide);
+    for (int marker : {1, 2}) {
+        const int x = rangeMarkerX(marker == 1 ? range.first : range.last);
+        if (x < 0 || x >= w) continue;
+        const RECT handle = rangeHandle(marker, x);
+        HBRUSH fill = CreateSolidBrush(marker == S.rangeDrag ? kBarGreen : RGB(32, 83, 146));
+        FillRect(dc, &handle, fill);
+        DeleteObject(fill);
+        RECT arrows = handle;
+        SetTextColor(dc, RGB(255, 255, 255));
+        SetTextAlign(dc, TA_TOP | TA_LEFT);
+        DrawTextW(dc, marker == 1 ? L"▸" : L"◂", -1, &arrows,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     }
+    restoreDrawing();
 
     // percentage and progress bar
     if (layer.total > 0) {
@@ -873,8 +1035,15 @@ void drawScene(HDC dc, int w, int h) {
     }
 }
 
+int hitPreviewArrow(POINT mouse) {
+    if (!previewZoomed() || S.rangeDrag || S.panButton) return -1;
+    return preview::hitArrow(mouse, S.cw, S.ch - bottomPad(), dp);
+}
+
 LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_DROPFILES:
+            return SendMessageW(S.hwnd, msg, wParam, lParam);
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT: {
@@ -890,6 +1059,7 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 HGDIOBJ old = SelectObject(mem, bmp);
                 FillRect(mem, &rc, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
                 drawScene(mem, w, h);
+                if (previewZoomed()) preview::drawArrows(mem, w, h - bottomPad(), dp);
                 BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
                 SelectObject(mem, old);
                 DeleteObject(bmp);
@@ -898,24 +1068,64 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             EndPaint(hwnd, &ps);
             return 0;
         }
-        case WM_LBUTTONDOWN:
+        case WM_LBUTTONDOWN: {
+            const POINT mouse{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (S.panButton || hitPreviewArrow(mouse) >= 0) return 0;
+            S.rangeDrag = hitRangeHandle(mouse);
+            if (S.rangeDrag) {
+                const auto& layer = S.layers[static_cast<size_t>(S.shown)];
+                const auto range = vega::feedRange(previewFeedBox(), S.calibration.feed, layer.from, layer.to);
+                S.rangeDragOffset = mouse.x - rangeMarkerX(S.rangeDrag == 1 ? range.first : range.last);
+                SetFocus(hwnd);
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            SetFocus(hwnd);
+            startPan(mouse.x, mouse.y, WM_LBUTTONUP);
+            return 0;
+        }
         case WM_MBUTTONDOWN:
             SetFocus(hwnd);
-            startPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            startPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), WM_MBUTTONUP);
             return 0;
         case WM_LBUTTONUP:
         case WM_MBUTTONUP:
-            if (S.panning) {
-                S.panning = false;
+            if (S.rangeDrag && msg == WM_LBUTTONUP) {
+                dragRangeHandle(GET_X_LPARAM(lParam));
+                S.rangeDrag = 0;
+                ReleaseCapture();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (S.panButton == msg) {
+                S.panButton = 0;
                 ReleaseCapture();
             }
             return 0;
         case WM_CAPTURECHANGED:
-            S.panning = false;
+            S.panButton = 0;
+            S.rangeDrag = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_MOUSEMOVE:
-            onMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            if (S.rangeDrag) dragRangeHandle(GET_X_LPARAM(lParam));
+            else if (S.panButton) onMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            else if (hitPreviewArrow({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}) >= 0)
+                SetTimer(hwnd, preview::hoverTimer, 25, nullptr);
+            else KillTimer(hwnd, preview::hoverTimer);
             return 0;
+        case WM_TIMER: {
+            if (wParam != preview::hoverTimer) break;
+            const int arrow = preview::hoveredArrow(hwnd, hitPreviewArrow);
+            if (arrow < 0) {
+                KillTimer(hwnd, preview::hoverTimer);
+                return 0;
+            }
+            const POINT direction = preview::previewDirections[arrow];
+            S.vx += direction.x * dp(10) / S.vs;
+            S.vy -= direction.y * dp(10) / S.vs;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         case WM_MOUSEWHEEL: {
             POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ScreenToClient(hwnd, &p);
@@ -924,7 +1134,13 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         case WM_SETCURSOR:
             if (LOWORD(lParam) == HTCLIENT) {
-                SetCursor(LoadCursorW(nullptr, S.panning ? kCursorMove : kCursorArrow));
+                POINT pt{};
+                GetCursorPos(&pt);
+                ScreenToClient(hwnd, &pt);
+                const auto resize = MAKEINTRESOURCEW(32644);
+                SetCursor(LoadCursorW(nullptr, S.panButton ? kCursorMove :
+                                       hitPreviewArrow(pt) >= 0 ? MAKEINTRESOURCEW(32649) :
+                                       S.rangeDrag || hitRangeHandle(pt) ? resize : kCursorArrow));
                 return TRUE;
             }
             break;
@@ -992,8 +1208,7 @@ void onSelect() {
     rebuildView();
 }
 
-void addFiles() {
-    std::vector<std::wstring> files = pickFiles();
+void addFiles(const std::vector<std::wstring>& files) {
     if (files.empty()) {
         return;
     }
@@ -1013,6 +1228,30 @@ void addFiles() {
     fillList();
     SendMessageW(S.list, LB_SETCURSEL, static_cast<WPARAM>(first), 0);
     onSelect();
+}
+
+void addDroppedFiles(HDROP drop) {
+    struct DropHandle {
+        HDROP handle;
+        ~DropHandle() { DragFinish(handle); }
+    } owned{drop};
+    if (S.running) return;
+
+    std::vector<std::wstring> files;
+    const UINT count = DragQueryFileW(drop, 0xffffffffu, nullptr, 0);
+    files.reserve(count);
+    for (UINT i = 0; i < count; ++i) {
+        const UINT length = DragQueryFileW(drop, i, nullptr, 0);
+        if (!length) continue;
+        std::wstring path(length + 1, L'\0');
+        if (DragQueryFileW(drop, i, path.data(), length + 1) != length) continue;
+        path.resize(length);
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+            files.push_back(std::move(path));
+    }
+    if (!files.empty()) addFiles(files);
+    else setStatus(L"Drop one or more plot files into the queue.", true);
 }
 
 void removeSelected() {
@@ -1131,6 +1370,7 @@ void drawChip(HDC dc, const RECT& chip, const wchar_t* text, bool sel, bool arro
 WNDPROC g_listProc = nullptr;
 
 LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DROPFILES) return SendMessageW(S.hwnd, msg, wParam, lParam);
     if (msg == WM_LBUTTONDOWN && !S.running) {
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
@@ -1173,6 +1413,7 @@ struct ThreadArg {
     HDC printer = nullptr;
     ~ThreadArg() { if (printer) DeleteDC(printer); }
     double paperWidth = 0;
+    bool useCapturedSquare = false;
     cal::Factors calibration;
 };
 
@@ -1193,106 +1434,347 @@ std::string hexBytes(const std::string& bytes) {
     return hex;
 }
 
-bool checkVega(Transport& usb, std::string& log, std::string& result) {
-    if (!usb.open(result)) return false;
+bool checkVega(Transport& usb, std::string& log, std::string& result, int& statusWord, unsigned* bandsConsumed = nullptr, unsigned* lastCommand = nullptr) {
     log += usb.description() + "\n";
-    // AlgotexOcx 0x1000f746 -> 0x1001a0a0 -> 0x1001a020 stores the command big-endian.
+    // Capture frames 43, 46 and 48 show a direct status response on the command pipe.
     const std::string request = proto::frame(0x3F, proto::be16(0x1A));
-    auto read = [&](std::string& value, const char* label) {
-        size_t offset = 0;
-        while (offset < value.size()) {
-            size_t got = 0;
-            const bool ok = usb.read(reinterpret_cast<unsigned char*>(value.data()) + offset,
-                                     value.size() - offset, got, result);
-            offset += got;
-            if (!ok || !got) {
-                log += std::string(label) + ": " + hexBytes(value.substr(0, offset)) + "\n";
-                if (ok) result = std::string("Empty read while receiving ") + label;
-                return false;
-            }
-        }
-        log += std::string(label) + ": " + hexBytes(value) + "\n";
-        return true;
-    };
-    std::string ack(1, '\0');
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    log += "Status request: " + hexBytes(request) + "\n";
+    constexpr DWORD busyDelays[]{100, 200, 300, 500, 750, 1000};
+    for (size_t attempt = 0;; ++attempt) {
         size_t sent = 0;
-        log += "Status request: " + hexBytes(request) + "\n";
-        if (usb.write(reinterpret_cast<const unsigned char*>(request.data()), request.size(), sent, result) ||
-            sent != request.size()) {
+        const int code = usb.write(reinterpret_cast<const unsigned char*>(request.data()), request.size(), sent, result);
+        if (code == 0 && sent == request.size()) break;
+        if (code != 2 || sent != 0 || attempt == std::size(busyDelays)) {
             if (result.empty()) result = "Incomplete status request";
             return false;
         }
-        if (!read(ack, "ACK")) return false;
-        if (ack[0] != 1) break;
+        log += "Status endpoint busy. Retrying status query.\n";
+        Sleep(busyDelays[attempt]);
     }
-    if (ack[0] != 0) {
-        result = "Plotter did not accept the status request";
+    // A previous host can leave unread status bytes in the device queue.
+    constexpr size_t payloadSize = 64;
+    constexpr size_t frameSize = 8 + payloadSize + 2;
+    std::string pending;
+    std::string body;
+    const ULONGLONG deadline = GetTickCount64() + 2500;
+    for (int packet = 0; packet < 8 && GetTickCount64() < deadline; ++packet) {
+        unsigned char buffer[512];
+        size_t got = 0;
+        if (!usb.read(buffer, sizeof(buffer), got, result)) return false;
+        if (!got) continue;
+        const std::string bytes(reinterpret_cast<const char*>(buffer), got);
+        log += "Bulk IN: " + hexBytes(bytes) + "\n";
+        pending += bytes;
+        while (pending.size() >= 8) {
+            size_t length = 0;
+            if (!proto::checkHeader(pending.substr(0, 8), 0x1A, length, result) ||
+                length != payloadSize) {
+                pending.erase(0, 1);
+                continue;
+            }
+            if (pending.size() < frameSize) break;
+            body = pending.substr(8, payloadSize + 2);
+            if (proto::checkBody(pending.substr(0, 8), body, result)) break;
+            body.clear();
+            pending.erase(0, 1);
+        }
+        if (!body.empty()) break;
+    }
+    if (body.empty()) {
+        result = "No complete VEGA status reply received";
         return false;
     }
-    std::string header(8, '\0');
-    size_t length = 0;
-    if (!read(header, "Reply header") || !proto::checkHeader(header, 0x1A, length, result)) return false;
-    std::string body(length + 2, '\0');
-    if (!read(body, "Reply body") || !proto::checkBody(header, body, result)) return false;
-    result = "VEGA status reply verified (" + std::to_string(length) + " data bytes)";
+    const auto word = [&](size_t offset) {
+        return (static_cast<unsigned char>(body[offset]) << 8) |
+                static_cast<unsigned char>(body[offset + 1]);
+    };
+    const int state = word(0);
+    if (bandsConsumed) *bandsConsumed = (static_cast<unsigned>(word(10)) << 16) | word(12);
+    if (lastCommand) *lastCommand = word(40);
+    // AlgoServer 0x423034 recognizes the four active plot states.
+    // Its status response tests 0x10 in the word at offset 8 for the ink indicator.
+    statusWord = state | ((word(8) & 0x10) << 12);
+    result = "VEGA status reply verified (" + std::to_string(payloadSize) + " data bytes)";
     return true;
+}
+
+struct VegaPrintData {
+    std::string record;
+    std::string_view header;
+    unsigned bandCount = 0;
+    std::function<std::string(unsigned)> encodeBand;
+};
+
+VegaPrintData capturedSquare(double spacingMm) {
+    constexpr unsigned packets[]{46, 34, 34, 34, 34, 34, 34, 48};
+    const HMODULE module = GetModuleHandleW(nullptr);
+    const HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_VEGA_SQUARE), RT_RCDATA);
+    if (!resource || SizeofResource(module, resource) != 64 + 468 + 298 * vega::packetSize)
+        throw std::runtime_error("The embedded XP square raster is missing or invalid.");
+    const auto* cursor = static_cast<const char*>(LockResource(LoadResource(module, resource)));
+    if (!cursor) throw std::runtime_error("Could not load the embedded XP square raster.");
+    VegaPrintData data{vega::capturedSquareRecord(std::string_view(cursor, 64), spacingMm), std::string_view(cursor + 64, 468),
+                       static_cast<unsigned>(std::size(packets)), {}};
+    std::vector<std::string_view> bands;
+    cursor += 532;
+    for (const auto count : packets) {
+        bands.emplace_back(cursor, count * vega::packetSize);
+        cursor += bands.back().size();
+    }
+    data.encodeBand = [bands = std::move(bands)](unsigned index) { return std::string(bands.at(index)); };
+    return data;
+}
+
+template <class Usb>
+bool printVega(Usb& usb, const VegaPrintData& data, const Job& job, const Settings& cfg,
+               HWND hwnd, std::string& result, bool& jobStarted) {
+    if (data.bandCount == 0 || !data.encodeBand) {
+        result = "The job has no VEGA raster bands.";
+        return false;
+    }
+    const unsigned bandCount = data.bandCount;
+    const auto progress = [&](unsigned consumed) {
+        const size_t confirmed = job.plan.bytes.size() * consumed / bandCount;
+        PostMessageW(hwnd, kMsgProg, job.index, static_cast<LPARAM>(confirmed));
+    };
+    const auto send = [&](UCHAR pipe, std::string_view data) {
+        size_t sent = 0;
+        if (usb.writeEndpoint(pipe, reinterpret_cast<const unsigned char*>(data.data()), data.size(), sent, result) ||
+            sent != data.size()) {
+            if (result.empty()) result = "Short VEGA USB write.";
+            return false;
+        }
+        return true;
+    };
+    int state = -1;
+    unsigned consumed = 0;
+    unsigned command = 0;
+    unsigned lastProgress = 0;
+    bool trackBands = false;
+    int lastIndicatorWord = -1;
+    const auto publish = [&](int word) {
+        if (word == lastIndicatorWord) return;
+        lastIndicatorWord = word;
+        PostMessageW(hwnd, kMsgPrintStatus, 0, word);
+    };
+    const auto poll = [&] {
+        std::string log;
+        if (!checkVega(usb, log, result, state, &consumed, &command)) {
+            publish(-2);
+            const auto path = std::filesystem::path(cfg.ini).replace_extension(L".usb.txt");
+            if (FILE* file = _wfopen(path.c_str(), L"wb")) {
+                log += result + "\n";
+                fwrite(log.data(), 1, log.size(), file);
+                fclose(file);
+            }
+            return false;
+        }
+        // Both vendor versions poll here between bands. Share the verified reply with the UI.
+        publish(state);
+        state &= 0xffff;
+        if (trackBands && consumed > lastProgress && consumed <= bandCount) {
+            lastProgress = consumed;
+            progress(consumed);
+        }
+        return true;
+    };
+    const auto waitFor = [&](const char* stage, ULONGLONG timeout, auto ready) {
+        const auto limit = GetTickCount64() + timeout;
+        while (!g_stop && GetTickCount64() < limit) {
+            if (!poll()) {
+                result = std::string(stage) + ": " + result;
+                return false;
+            }
+            if (ready()) return true;
+            Sleep(100);
+        }
+        if (!g_stop) {
+            char detail[120];
+            snprintf(detail, sizeof(detail), "%s timed out (VEGA state 0x%04X, bands consumed %u).", stage, state, consumed);
+            result = detail;
+        }
+        return false;
+    };
+    if (g_stop || !poll()) return false;
+    if (state != 0) {
+        result = "The VEGA is not idle. Clear or finish its current job first.";
+        return false;
+    }
+    // XP trace frames 1307 to 1347. The two job records include the XP-generated title and header raster.
+    if (!send(0x01, proto::frame(0x3F, proto::be16(0x1B)))) return false;
+    Sleep(400);
+    if (g_stop || !send(0x01, proto::frame(0x1E, proto::be16(0x62)))) return false;
+    if (!waitFor("Job setup", 3000, [&] { return command == 0x62 && state == 0; })) return false;
+    jobStarted = true;
+    if (!send(0x01, data.record)) return false;
+    Sleep(260);
+    if (g_stop || !send(0x01, proto::frame(0x3F, proto::be16(0x03)))) return false;
+    if (!waitFor("Job header", 5000, [&] { return state == 0x02; })) return false;
+    if (!data.header.empty() && !send(0x01, data.header)) return false;
+    Sleep(100);
+    if (!send(0x01, proto::frame(0x3F, proto::be16(0x04)))) return false;
+    trackBands = true;
+
+    const auto sendBand = [&](unsigned band, const char* stage) {
+        const auto payload = data.encodeBand(band);
+        auto deadline = GetTickCount64() + 20000;
+        bool paused = false;
+        for (;;) {
+            if (g_stop) return false;
+            if (!poll()) {
+                result = std::string(stage) + ": " + result;
+                return false;
+            }
+            // The print worker owns the USB endpoint throughout pause and resume.
+            const bool pauseRequested = g_pause;
+            if (pauseRequested && !paused && state >= 0x14 && state <= 0x17) {
+                // VEGA finishes its current motion and reports 0x17 when paused.
+                if (!send(0x01, proto::frame(0x3F, proto::be16(0x05)))) return false;
+                if (!waitFor("Pause", 20000, [&] { return state == 0x17; })) return false;
+                paused = true;
+                PostMessageW(hwnd, kMsgPauseState, TRUE, 0);
+            }
+            if (paused) {
+                if (state != 0x17) {
+                    result = "VEGA left its paused state.";
+                    return false;
+                }
+                if (!g_pause) {
+                    if (!send(0x01, proto::frame(0x3F, proto::be16(0x09)))) return false;
+                    paused = false;
+                    PostMessageW(hwnd, kMsgPauseState, FALSE, 0);
+                    deadline = GetTickCount64() + 20000;
+                }
+            } else {
+                const bool ready = cfg.bidi ? (state >= 0x15 && state <= 0x17) :
+                                   state == (band == 0 ? 0x15 : 0x16);
+                if (!pauseRequested && ready && consumed == band) break;
+                if (GetTickCount64() >= deadline) {
+                    result = std::string(stage) + " timed out (VEGA state " +
+                             std::to_string(state) + ", bands consumed " + std::to_string(consumed) + ").";
+                    return false;
+                }
+            }
+            Sleep(100);
+        }
+        // Complete the transfer once the band has been accepted.
+        if (g_stop) return false;
+        if (payload.empty() || payload.size() % vega::packetSize != 0) {
+            result = "Invalid VEGA raster band.";
+            return false;
+        }
+        const std::string_view wire(payload);
+        const auto packets = wire.size() / vega::packetSize;
+        const unsigned timing = data.header.empty() ? vega::bandTiming(packets, band == 0) :
+                               band == 0 ? 0x18 : 0x2D;
+        const auto begin = proto::frame(0x1C, proto::be16(0) + proto::be16(timing));
+        if (!send(0x01, begin)) return false;
+        unsigned char ack[2]{};
+        size_t got = 0;
+        if (!usb.readEndpoint(0x82, ack, sizeof(ack), got, result)) return false;
+        if (got != sizeof(ack) || ack[0] != 0 || ack[1] != 0x0F) {
+            result = "VEGA refused a raster band.";
+            return false;
+        }
+        for (size_t offset = 0; offset < payload.size(); offset += vega::packetSize) {
+            if (!send(0x02, wire.substr(offset, vega::packetSize))) return false;
+        }
+        if (!send(0x01, proto::frame(0x1D, proto::be16(0) + proto::be16(band + 1)))) return false;
+        return true;
+    };
+    const unsigned finalBand = bandCount - 1;
+    for (unsigned band = 0; band < finalBand; ++band) {
+        const auto stage = "Ready for band " + std::to_string(band + 1) + " of " + std::to_string(finalBand);
+        if (!sendBand(band, stage.c_str())) return false;
+    }
+    // The job record schedules final paper advance after the last raster band.
+    if (!sendBand(finalBand, "Ready for final paper advance")) return false;
+    if (!waitFor("Paper advance completion", 30000, [&] {
+        return state == 0x1E && consumed == bandCount;
+    })) return false;
+    if (!send(0x01, proto::frame(0x3F, proto::be16(0x23)))) return false;
+    return waitFor("Return to idle", 6000, [&] { return state == 0; });
+}
+
+DWORD WINAPI vegaPrintThread(LPVOID p) {
+    std::unique_ptr<ThreadArg> args(static_cast<ThreadArg*>(p));
+    bool allDone = false;
+    for (const auto& job : args->jobs) {
+        if (g_stop) break;
+        LibUsbKTransport usb(args->cfg.vid, args->cfg.pid, 0x01, std::min(args->cfg.timeoutMs, 2000));
+        std::string result;
+        bool done = false;
+        bool jobStarted = false;
+        try {
+            vega::RasterJob raster;
+            VegaPrintData data;
+            if (args->useCapturedSquare) {
+                data = capturedSquare(args->cfg.spacingMm);
+            } else {
+                raster = vega::rasterize(job.piece, job.stream, job.plan, args->calibration,
+                                         args->paperWidth * 0.025, args->cfg.rightMarginMm, args->cfg.spacingMm,
+                                         args->cfg.lineWidthMm, utf8(job.title), g_stop, args->cfg.bidi, job.range, args->cfg.shift);
+                data.record = std::move(raster.record);
+                data.bandCount = raster.bandCount;
+                data.encodeBand = std::move(raster.encodeBand);
+            }
+            if (!g_stop) {
+                if (usb.open(result) && usb.enableRasterEndpoints(result)) {
+                    done = printVega(usb, data, job, args->cfg, args->hwnd, result, jobStarted);
+                } else {
+                    PostMessageW(args->hwnd, kMsgPrintStatus, 0, -2);
+                }
+            }
+        } catch (const std::exception& e) {
+            result = e.what();
+        }
+        usb.close();
+        if (!done && jobStarted) PostMessageW(args->hwnd, kMsgVegaRecovery, 0, 0);
+        if (!done && !g_stop) postError(args->hwnd, utf8(job.title) + ": " + result);
+        PostMessageW(args->hwnd, kMsgDone, job.index, done ? 0 : g_stop ? 1 : 2);
+        if (!done) break;
+        allDone = &job == &args->jobs.back();
+    }
+    PostMessageW(args->hwnd, kMsgFinished, allDone, 0);
+    return 0;
 }
 
 DWORD WINAPI printThread(LPVOID p) {
     std::unique_ptr<ThreadArg> a(static_cast<ThreadArg*>(p));
-    if (!a->printer) {
-        std::unique_ptr<Transport> usb;
-        if (a->cfg.libusbK) {
-            auto backend = std::make_unique<LibUsbKTransport>(a->cfg.vid, a->cfg.pid, a->cfg.pipe, a->cfg.timeoutMs);
-            backend->forceIn = a->cfg.pipeIn;
-            usb = std::move(backend);
-        } else {
-            auto backend = std::make_unique<WinUsbTransport>(a->cfg.vid, a->cfg.pid, a->cfg.pipe, a->cfg.timeoutMs);
-            backend->forceIn = a->cfg.pipeIn;
-            usb = std::move(backend);
+    SetAbortProc(a->printer, [](HDC, int) -> BOOL { return !g_stop; });
+    for (const Job& job : a->jobs) {
+        if (g_stop) break;
+        std::string error;
+        PostMessageW(a->hwnd, kMsgProg, job.index, 0);
+        bool submitted = false;
+        try {
+            const int dpi = std::clamp(std::max(GetDeviceCaps(a->printer, LOGPIXELSX),
+                                               GetDeviceCaps(a->printer, LOGPIXELSY)), 75, 600);
+            submitted = printPlot(job.piece, job.stream, job.plan, a->calibration, a->paperWidth,
+                                  dpi, a->cfg.lineWidthMm, a->printer, job.title, g_stop, error);
+        } catch (const std::exception& e) {
+            error = e.what();
         }
-        std::string log = "Algotex VEGA status check\n";
-        std::string result;
-        const bool passed = checkVega(*usb, log, result);
-        usb->close();
-        log += result + "\n";
-        auto path = std::filesystem::path(a->cfg.ini);
-        path.replace_extension(L".usb.txt");
-        if (FILE* file = _wfopen(path.c_str(), L"wb")) {
-            const bool written = fwrite(log.data(), 1, log.size(), file) == log.size();
-            if (fclose(file) == 0 && written) result += " | Log: " + utf8(path.wstring());
-            else result += " | Could not write the USB log";
-        } else {
-            result += " | Could not open the USB log";
-        }
-        auto detail = std::make_unique<std::string>(std::move(result));
-        if (PostMessageW(a->hwnd, kMsgUsbResult, passed, reinterpret_cast<LPARAM>(detail.get()))) {
-            detail.release();
-        }
-    } else {
-        SetAbortProc(a->printer, [](HDC, int) -> BOOL { return !g_stop; });
-        for (const Job& job : a->jobs) {
-            if (g_stop) break;
-            std::string error;
-            PostMessageW(a->hwnd, kMsgProg, job.index, 0);
-            bool submitted = false;
-            try {
-                const int dpi = std::clamp(std::max(GetDeviceCaps(a->printer, LOGPIXELSX),
-                                                   GetDeviceCaps(a->printer, LOGPIXELSY)), 75, 600);
-                submitted = printPlot(job.piece, job.stream, job.plan, a->calibration, a->paperWidth,
-                                      dpi, a->cfg.lineWidthMm, a->printer, job.title, g_stop, error);
-            } catch (const std::exception& e) {
-                error = e.what();
-            }
-            if (!submitted && !g_stop) postError(a->hwnd, utf8(job.title) + ": " + error);
-            PostMessageW(a->hwnd, kMsgDone, job.index, submitted ? 0 : g_stop ? 1 : 2);
-            if (!submitted) break;
-        }
+        if (!submitted && !g_stop) postError(a->hwnd, utf8(job.title) + ": " + error);
+        PostMessageW(a->hwnd, kMsgDone, job.index, submitted ? 0 : g_stop ? 1 : 2);
+        if (!submitted) break;
     }
     PostMessageW(a->hwnd, kMsgFinished, 0, 0);
     return 0;
 }
+bool canPrint() {
+    return !S.running && !S.maintenanceRunning && S.connectionThread && S.statusWord >= 0 &&
+           (S.statusWord & 0xffff) == 0 && !S.recoveryRequired &&
+           WaitForSingleObject(S.disconnect, 0) == WAIT_TIMEOUT;
+}
+
+void updatePrintButton() {
+    const bool ready = canPrint();
+    EnableWindow(S.btnStart, ready);
+    EnableWindow(S.btnCleanHeads, ready);
+    EnableWindow(S.btnAdvancePaper, ready);
+}
+
 void setRunning(bool running) {
     S.running = running;
     EnableWindow(S.btnAdd, !running);
@@ -1300,42 +1782,302 @@ void setRunning(bool running) {
     EnableWindow(S.edit, !running);
     EnableWindow(S.editFrom, !running);
     EnableWindow(S.editTo, !running);
-    EnableWindow(S.btnCalibrate, !running);
-    EnableWindow(S.btnStart, !running);
+    updatePrintButton();
+    EnableWindow(S.printAuto, !running);
     EnableWindow(S.btnTestUsb, !running);
+    EnableWindow(S.btnServerConfig, !running);
     EnableWindow(S.btnStop, running);
+    EnableWindow(S.btnPause, running);
+    SetWindowTextW(S.btnPause, L"Pause");
 }
 
-void testUsb() {
-    if (S.running) {
+void showIndicators(int word) {
+    S.statusWord = word;
+    const wchar_t* labels[]{L"Online", L"Cover", L"Paper", L"Error", L"Plot", L"Ink", L"Man"};
+    const int state = word & 0xffff;
+    const bool online = word >= 0;
+    const wchar_t* values[]{online ? L"Yes" : L"No",
+        online ? (state == 0xffff ? L"Check" : L"Clear") : L"—",
+        L"—",
+        word == -2 ? L"USB" : L"—",
+        online ? (state >= 0x14 && state <= 0x17 ? L"Active" : L"Idle") : L"—",
+        online ? (word & 0x10000 ? L"Check" : L"Clear") : L"—",
+        SendMessageW(S.printAuto, BM_GETCHECK, 0, 0) == BST_CHECKED ? L"Auto" : L"Manual"};
+    for (size_t i = 0; i < std::size(labels); ++i) {
+        const wchar_t* value = values[i];
+        SetWindowTextW(S.indicators[i], (std::wstring(labels[i]) + L"  " + value).c_str());
+    }
+}
+
+struct Connection {
+    Settings cfg;
+    HWND hwnd;
+    HANDLE disconnect;
+    bool resetOnConnect;
+};
+
+bool resetVega(Transport& usb, HANDLE disconnect, std::string& log, std::string& result) {
+    // AlgoServer's resetError and print-abort handlers send request 0x1B.
+    const auto command = proto::frame(0x3F, proto::be16(0x1B));
+    log += "Reset request: " + hexBytes(command) + "\n";
+    size_t sent = 0;
+    if (usb.write(reinterpret_cast<const unsigned char*>(command.data()), command.size(), sent, result) ||
+        sent != command.size()) {
+        if (result.empty()) result = "Incomplete VEGA reset request.";
+        return false;
+    }
+    const auto limit = GetTickCount64() + 8000;
+    int status = -1;
+    while (GetTickCount64() < limit && WaitForSingleObject(disconnect, 200) == WAIT_TIMEOUT) {
+        if (checkVega(usb, log, result, status) && (status & 0xffff) == 0) return true;
+    }
+    if (WaitForSingleObject(disconnect, 0) == WAIT_TIMEOUT) {
+        result = status < 0 ? "VEGA stopped responding after the reset request. " + result :
+                              "VEGA did not return to idle after the reset request.";
+    }
+    return false;
+}
+
+bool cleanVegaHeads(Transport& usb, std::string& log, std::string& result) {
+    int status = -1;
+    if (!checkVega(usb, log, result, status)) return false;
+    if ((status & 0xffff) != 0) {
+        result = "Wait for the VEGA to go idle before cleaning the heads.";
+        return false;
+    }
+
+    const auto send = [&](unsigned code) {
+        const auto request = proto::frame(0x3F, proto::be16(code));
+        log += "Head cleaning request: " + hexBytes(request) + "\n";
+        size_t sent = 0;
+        result.clear();
+        if (usb.write(reinterpret_cast<const unsigned char*>(request.data()), request.size(), sent, result) == 0 &&
+            sent == request.size()) return true;
+        if (result.empty()) result = "Incomplete VEGA head cleaning request.";
+        return false;
+    };
+
+    // AlgoServer 0x4221d0 and AlgotexOcx 0x1000fd29 send the same sequence.
+    if (!send(0x2B)) return false;
+    if (!send(0x2A)) {
+        const auto error = result;
+        send(0x2D);
+        result = error;
+        return false;
+    }
+    Sleep(1000);
+    if (!send(0x2D)) return false;
+    const auto deadline = GetTickCount64() + 8000;
+    do {
+        if (!checkVega(usb, log, result, status)) return false;
+        if ((status & 0xffff) == 0) return true;
+        Sleep(200);
+    } while (GetTickCount64() < deadline);
+    result = "The VEGA did not return to idle after head cleaning.";
+    return false;
+}
+
+bool advanceVegaPaper(Transport& usb, std::string& log, std::string& result) {
+    int status = -1;
+    if (!checkVega(usb, log, result, status)) return false;
+    if ((status & 0xffff) != 0) {
+        result = "Wait for the VEGA to go idle before advancing paper.";
+        return false;
+    }
+    const auto send = [&](unsigned code, std::string& error) {
+        const auto frame = proto::frame(0x3F, proto::be16(code));
+        size_t sent = 0;
+        return usb.write(reinterpret_cast<const unsigned char*>(frame.data()), frame.size(), sent, error) == 0 &&
+               sent == frame.size();
+    };
+    // AlgoServer advancePaper sends 0x1D for forward motion and 0x1C on release.
+    result.clear();
+    const bool started = send(0x1D, result);
+    if (started) Sleep(1000);
+    std::string stopError;
+    if (!send(0x1C, stopError)) {
+        result = "Could not confirm paper advance stop. " + stopError;
+        return false;
+    }
+    if (!started && result.empty()) result = "Could not start paper advance.";
+    return started;
+}
+
+DWORD WINAPI monitorVega(LPVOID p) {
+    std::unique_ptr<Connection> connection(static_cast<Connection*>(p));
+    const auto& cfg = connection->cfg;
+    std::unique_ptr<Transport> usb;
+    std::string result;
+    const auto open = [&](auto candidate) {
+        candidate->forceIn = cfg.pipeIn;
+        if (candidate->open(result)) usb = std::move(candidate);
+    };
+    const int timeout = std::min(cfg.timeoutMs, 2000);
+    const auto connect = [&] {
+        if (_wcsicmp(cfg.backend.c_str(), L"WinUSB") != 0)
+            open(std::make_unique<LibUsbKTransport>(cfg.vid, cfg.pid, cfg.pipe, timeout));
+        if (!usb && _wcsicmp(cfg.backend.c_str(), L"libusbK") != 0)
+            open(std::make_unique<WinUsbTransport>(cfg.vid, cfg.pid, cfg.pipe, timeout));
+    };
+    const auto deadline = GetTickCount64() + 8000;
+    std::string log;
+    int word = -1;
+    while (WaitForSingleObject(connection->disconnect, 0) == WAIT_TIMEOUT) {
+        connect();
+        if (usb && checkVega(*usb, log, result, word)) break;
+        usb.reset();
+        if (!connection->resetOnConnect || GetTickCount64() >= deadline ||
+            WaitForSingleObject(connection->disconnect, 250) != WAIT_TIMEOUT) break;
+    }
+    if (usb && connection->resetOnConnect &&
+        WaitForSingleObject(connection->disconnect, 0) == WAIT_TIMEOUT) {
+        result.clear();
+        if (resetVega(*usb, connection->disconnect, log, result)) {
+            PostMessageW(connection->hwnd, kMsgVegaRecovery, 1, 0);
+            word = 0;
+        } else {
+            usb.reset();
+        }
+    }
+    while (usb && WaitForSingleObject(connection->disconnect, 0) == WAIT_TIMEOUT) {
+        PostMessageW(connection->hwnd, kMsgUsbResult, static_cast<WPARAM>(word + 1), 0);
+        if (WaitForSingleObject(connection->disconnect, 500) != WAIT_TIMEOUT) break;
+        log.clear();
+        const auto maintenance = g_maintenance.exchange(MaintenanceAction::None);
+        if (maintenance != MaintenanceAction::None) {
+            auto detail = std::make_unique<std::string>();
+            const bool cleaning = maintenance == MaintenanceAction::CleanHeads;
+            const bool ok = cleaning ? cleanVegaHeads(*usb, log, *detail) :
+                                       advanceVegaPaper(*usb, log, *detail);
+            if (PostMessageW(connection->hwnd, kMsgHeadCleanDone, (cleaning ? 2 : 0) | (ok ? 1 : 0),
+                             reinterpret_cast<LPARAM>(detail.get()))) detail.release();
+        }
+        result.clear();
+        if (!checkVega(*usb, log, result, word)) break;
+    }
+    usb.reset();
+    if (WaitForSingleObject(connection->disconnect, 0) == WAIT_OBJECT_0) result.clear();
+    else {
+        auto path = std::filesystem::path(cfg.ini);
+        path.replace_extension(L".usb.txt");
+        if (FILE* file = _wfopen(path.c_str(), L"wb")) {
+            log += result + "\n";
+            fwrite(log.data(), 1, log.size(), file);
+            fclose(file);
+        }
+    }
+    auto detail = std::make_unique<std::string>(std::move(result));
+    if (PostMessageW(connection->hwnd, kMsgUsbResult, 0, reinterpret_cast<LPARAM>(detail.get()))) detail.release();
+    return 0;
+}
+
+void testUsb(bool afterPrint = false) {
+    if (S.connectionThread) {
+        SetEvent(S.disconnect);
+        EnableWindow(S.btnTestUsb, FALSE);
+        updatePrintButton();
         return;
     }
-    auto a = std::make_unique<ThreadArg>();
-    a->cfg = S.cfg;
-    a->hwnd = S.hwnd;
-    S.thread = CreateThread(nullptr, 0, printThread, a.get(), 0, nullptr);
-    if (!S.thread) {
-        setStatus(L"Could not start the USB test: " + wide(winErrorText(GetLastError())), true);
+    S.disconnect = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!S.disconnect) {
+        setStatus(L"Could not create the USB connection event.", true);
         return;
     }
-    a.release();
+    auto args = std::make_unique<Connection>(Connection{S.cfg, S.hwnd, S.disconnect, S.recoveryRequired});
+    auto* raw = args.release();
+    S.connectionThread = CreateThread(nullptr, 0, monitorVega, raw, 0, nullptr);
+    if (!S.connectionThread) {
+        delete raw;
+        CloseHandle(S.disconnect);
+        S.disconnect = nullptr;
+        setStatus(L"Could not start the USB connection.", true);
+        return;
+    }
+    S.reconnectingAfterPrint = afterPrint;
+    SetWindowTextW(S.btnTestUsb, L"Disconnect");
+    if (!afterPrint) setStatus(S.recoveryRequired ? L"Reconnecting and resetting VEGA..." : L"Connecting to VEGA...", false);
+}
+
+bool startVegaJobs(std::vector<Job> jobs, double paperWidth) {
+    if (!canPrint()) {
+        setStatus(L"Connect to an idle VEGA before printing.", true);
+        return false;
+    }
+    constexpr char square[] = "IN;SP1;PA;PU0,0;PD4000,0,4000,4000,0,4000,0,0;PU250,250;PD650,450;PU;SP0;";
+    bool captured = false;
+    if (jobs.size() == 1 && jobs.front().index >= 0) {
+        const Layer& layer = S.layers[static_cast<size_t>(jobs.front().index)];
+        if (layer.unit == 0 && !layer.noHeader && layer.from == 0 &&
+            layer.to == 100 && !S.cfg.bidi && S.cfg.rotation == 0 &&
+            S.calibration.feed == 1 && S.calibration.across == 1) {
+            try {
+                std::string hpgl = rm::readFile(layer.path);
+                while (!hpgl.empty() && (hpgl.back() == '\r' || hpgl.back() == '\n')) hpgl.pop_back();
+                captured = hpgl == square;
+            } catch (const std::exception& e) {
+                setStatus(wide(e.what()), true);
+                return false;
+            }
+        }
+    }
+    const wchar_t* prompt = captured ?
+        L"Print the verified XP square and its title header?" :
+        S.cfg.bidi ? L"Print in Bidi? Check that lines align across forward and reverse passes." :
+        L"Print in Mono?" ;
+    if (MessageBoxW(S.hwnd, prompt, L"Print to Algotex VEGA", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return false;
+    if (!canPrint()) {
+        setStatus(L"The VEGA connection is no longer ready.", true);
+        return false;
+    }
+    auto args = std::make_unique<ThreadArg>();
+    args->jobs = std::move(jobs);
+    args->cfg = S.cfg;
+    args->hwnd = S.hwnd;
+    args->paperWidth = paperWidth;
+    args->calibration = S.calibration;
+    args->useCapturedSquare = captured;
+    g_stop = false;
+    g_pause = false;
+    S.pendingPrint = std::move(args);
     setRunning(true);
-    EnableWindow(S.btnStop, FALSE);
-    setStatus(L"Checking VEGA status...", false);
+    setStatus(captured ? L"Sending XP test square to VEGA..." : L"Preparing VEGA raster...", false);
+    SetEvent(S.disconnect);
+    return true;
 }
 
 void startPrint() {
-    if (S.running || S.layers.empty()) {
+    if (S.running || S.layers.empty()) return;
+    if (!canPrint()) {
+        setStatus(L"Connect to an idle VEGA before printing.", true);
         return;
     }
+    std::vector<int> pending;
+    if (SendMessageW(S.printAuto, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        for (size_t i = 0; i < S.layers.size(); ++i) {
+            if (S.layers[i].status != L"done") pending.push_back(static_cast<int>(i));
+        }
+        if (pending.empty()) {
+            setStatus(L"No waiting files to print.", false);
+            return;
+        }
+    } else {
+        const int selected = selectedIndex();
+        if (selected < 0) {
+            setStatus(L"Select a file to print.", false);
+            return;
+        }
+        pending.push_back(selected);
+    }
     std::optional<double> width = paperUnits();
-    if (!width) {
-        message(L"Type the paper width in cm first.", L"Paper width needed", MB_ICONINFORMATION);
+    if (!width || *width <= 0) {
+        message(L"Enter a paper width greater than the right margin.", L"Paper width needed", MB_ICONINFORMATION);
         SetFocus(S.edit);
         return;
     }
-    int first = std::max(selectedIndex(), 0);
-    std::vector<int> bad = tooWide(first);
+    std::vector<int> bad = tooWide(pending.front());
+    bad.erase(std::remove_if(bad.begin(), bad.end(), [&](int index) {
+        return !std::binary_search(pending.begin(), pending.end(), index);
+    }), bad.end());
     if (!bad.empty()) {
         std::wstring list;
         for (size_t i = 0; i < bad.size(); ++i) {
@@ -1349,7 +2091,7 @@ void startPrint() {
     }
     std::vector<Job> jobs;
     std::wstring problems;
-    for (int i = first; i < static_cast<int>(S.layers.size()); ++i) {
+    for (const int i : pending) {
         Layer& l = S.layers[static_cast<size_t>(i)];
         l.sent = 0;
         l.pct = 0;
@@ -1358,10 +2100,11 @@ void startPrint() {
             rm::Req q;
             q.path = l.path;
             q.unit = kUnitMm[l.unit];
+            q.deg = drawingRotation(l);
             q.noHeader = l.noHeader;
             std::vector<rm::Piece> placed = rm::placeLayers(S.cache, {q}, width);
             rp::Stream st = rp::makeStream(placed[0], kHpglOutputStepMm, S.calibration);
-            rp::Plan plan = rp::makePlan(st, l.from, l.to);
+            rp::Plan plan = rp::makePlan(st, 0, 100);
             if (plan.bytes.empty()) {
                 l.status = L"empty";
                 invalidateRow(i);
@@ -1374,6 +2117,13 @@ void startPrint() {
             j.piece = std::move(placed[0]);
             j.stream = std::move(st);
             j.plan = std::move(plan);
+            if (l.from > 0 || l.to < 100) {
+                const auto bounds = rm::boxOf(j.piece.ops);
+                if (!bounds) throw std::runtime_error("The drawing has no feed bounds.");
+                j.range = vega::feedRange(*bounds, S.calibration.feed, l.from, l.to);
+                if (l.to <= l.from || j.range->last <= j.range->first)
+                    throw std::runtime_error("The selected percentages cover no complete VEGA band.");
+            }
             j.title = baseName(l.path);
             jobs.push_back(std::move(j));
         } catch (const std::exception& e) {
@@ -1387,7 +2137,7 @@ void startPrint() {
         setStatus(L"File error: " + problems, true);
         message(problems, L"Some files cannot be printed", MB_ICONERROR);
     }
-    if (!jobs.empty() && !startWindowsPrint(S.hwnd, std::move(jobs), *width, S.calibration)) {
+    if (!jobs.empty() && !startVegaJobs(std::move(jobs), *width)) {
         for (Layer& layer : S.layers) {
             if (layer.status == L"queued") {
                 layer.status.clear();
@@ -1399,6 +2149,7 @@ void startPrint() {
     InvalidateRect(S.list, nullptr, FALSE);
 }
 
+// Calibration rectangles can also be submitted through a Windows printer queue.
 bool startWindowsPrint(HWND owner, std::vector<Job> jobs, double paperWidth, cal::Factors factors) {
     PRINTDLGW dlg{};
     dlg.lStructSize = sizeof(dlg);
@@ -1423,6 +2174,7 @@ bool startWindowsPrint(HWND owner, std::vector<Job> jobs, double paperWidth, cal
     args->paperWidth = paperWidth;
     args->calibration = factors;
     g_stop = false;
+    g_pause = false;
     S.thread = CreateThread(nullptr, 0, printThread, args.get(), 0, nullptr);
     if (!S.thread) {
         MessageBoxW(owner, wide(winErrorText(GetLastError())).c_str(), L"Print", MB_OK | MB_ICONERROR);
@@ -1430,6 +2182,7 @@ bool startWindowsPrint(HWND owner, std::vector<Job> jobs, double paperWidth, cal
     }
     args.release();
     setRunning(true);
+    EnableWindow(S.btnPause, FALSE);
     setStatus(L"Submitting to Windows printer...", false);
     return true;
 }
@@ -1495,7 +2248,7 @@ void createControls(HWND hwnd) {
 
     addLabel(hwnd, L"Paper width (cm)", dp(2));
     S.edit = addEdit(hwnd, ID_WIDTH, 70, dp(22));
-    SetWindowTextW(S.edit, iniText(L"WidthCm", L"").c_str());
+    SetWindowTextW(S.edit, iniText(L"WidthCm", L"195").c_str());
 
     addButton(hwnd, ID_ZOOMOUT, L"\u2212", 22, dp(2), false);
     addButton(hwnd, ID_ZOOMIN, L"+", 22, dp(2), false);
@@ -1506,10 +2259,21 @@ void createControls(HWND hwnd) {
     addLabel(hwnd, L"To %", dp(2));
     S.editTo = addEdit(hwnd, ID_TO, 52, dp(22));
 
-    S.btnCalibrate = addButton(hwnd, ID_CALIBRATE, L"Calibrate", 74, dp(22), false);
+    S.printAuto = CreateWindowExW(0, L"BUTTON", L"Print auto",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 10, 10,
+        hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PRINT_AUTO)), S.inst, nullptr);
+    SendMessageW(S.printAuto, WM_SETFONT, reinterpret_cast<WPARAM>(S.font), TRUE);
+    addSlot(S.printAuto, textWidth(L"Print auto", S.font) + dp(23), dp(32), dp(6), true, 0);
     S.btnStart = addButton(hwnd, ID_START, L"Print", 40, dp(4), true);
-    S.btnStop = addButton(hwnd, ID_STOP, L"Stop", 40, 0, false);
-    S.btnTestUsb = addButton(hwnd, ID_TEST_USB, L"Check plotter", 70, 0, false);
+    updatePrintButton();
+    S.btnPause = addButton(hwnd, ID_PAUSE, L"Pause", 48, 0, false);
+    EnableWindow(S.btnPause, FALSE);
+    S.btnStop = addButton(hwnd, ID_STOP, L"Stop", 40, dp(10), false);
+    S.btnTestUsb = addButton(hwnd, ID_TEST_USB, L"Connect", 60, dp(10), false);
+    S.btnAdvancePaper = addButton(hwnd, ID_ADVANCE_PAPER, L"Advance paper", 20, dp(6), false);
+    S.btnCleanHeads = addButton(hwnd, ID_CLEAN_HEADS, L"Clean heads", 20, dp(6), false);
+    S.btnServerConfig = addButton(hwnd, ID_SERVER_CONFIG, L"Configuration", 24, dp(6), false);
+    updatePrintButton();
     EnableWindow(S.btnStop, FALSE);
 
     int largest = 0;
@@ -1524,6 +2288,10 @@ void createControls(HWND hwnd) {
     SendMessageW(S.list, WM_SETFONT, reinterpret_cast<WPARAM>(S.font), TRUE);
     g_listProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(S.list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ListProc)));
 
+    S.totalLength = CreateWindowExW(0, L"STATIC", L"Total length  0.00 m", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                    0, 0, 10, 10, hwnd, nullptr, S.inst, nullptr);
+    SendMessageW(S.totalLength, WM_SETFONT, reinterpret_cast<WPARAM>(S.bold), TRUE);
+
     S.usbStatus = CreateWindowExW(WS_EX_STATICEDGE, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
                                   0, 0, 10, 10, hwnd, nullptr, S.inst, nullptr);
     SendMessageW(S.usbStatus, WM_SETFONT, reinterpret_cast<WPARAM>(S.font), TRUE);
@@ -1532,6 +2300,12 @@ void createControls(HWND hwnd) {
                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_STATUS)), S.inst, nullptr);
     SendMessageW(S.status, WM_SETFONT, reinterpret_cast<WPARAM>(S.font), TRUE);
 
+    for (HWND& indicator : S.indicators) {
+        indicator = CreateWindowExW(WS_EX_STATICEDGE, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+                                    0, 0, 10, 10, hwnd, nullptr, S.inst, nullptr);
+        SendMessageW(indicator, WM_SETFONT, reinterpret_cast<WPARAM>(S.font), TRUE);
+    }
+    showIndicators(-1);
     S.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"RalvioliPlotPreview", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                                 0, 0, 10, 10, hwnd, nullptr, S.inst, nullptr);
 }
@@ -1567,7 +2341,7 @@ void layoutAll(int w, int h) {
     }
     int rows = row + 1;
     int barH = rows * rowH + (rows - 1) * rowGap + 2 * dp(8);
-    int statusH = dp(58);
+    int statusH = dp(83);
     int barTop = h - barH - statusH;
     struct Bounds {
         HWND window;
@@ -1582,14 +2356,21 @@ void layoutAll(int w, int h) {
     }
     int bodyTop = dp(10);
     int listW = dp(300);
-    int bodyH = std::max(barTop - dp(6) - bodyTop, dp(50));
+    const int summaryHeight = dp(24);
+    int bodyH = std::max(barTop - summaryHeight - dp(6) - bodyTop, dp(50));
+    children.push_back({S.totalLength, margin, barTop - summaryHeight, std::max(w - 2 * margin, 1), summaryHeight});
     children.push_back({S.list, dp(10), bodyTop, listW, bodyH});
     int px = dp(10) + listW + dp(10);
     children.push_back({S.preview, px, bodyTop, std::max(w - px - dp(10), dp(50)), bodyH});
     int statusTop = h - statusH;
     int statusWidth = std::max(w - 2 * margin, 1);
-    children.push_back({S.usbStatus, margin, statusTop, statusWidth, dp(22)});
-    children.push_back({S.status, margin, statusTop + dp(23), statusWidth, dp(32)});
+    for (int i = 0; i < 7; ++i) {
+        const int left = statusWidth * i / 7;
+        const int right = statusWidth * (i + 1) / 7;
+        children.push_back({S.indicators[i], margin + left, statusTop, right - left - dp(4), dp(21)});
+    }
+    children.push_back({S.usbStatus, margin, statusTop + dp(25), statusWidth, dp(22)});
+    children.push_back({S.status, margin, statusTop + dp(48), statusWidth, dp(32)});
 
     constexpr UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
     HDWP batch = BeginDeferWindowPos(static_cast<int>(children.size()));
@@ -1617,6 +2398,13 @@ void drawListItem(DRAWITEMSTRUCT* di) {
     SendMessageW(di->hwndItem, LB_GETTEXT, di->itemID, reinterpret_cast<LPARAM>(text.data()));
     bool has = di->itemID < S.layers.size();
     const Layer* layer = has ? &S.layers[di->itemID] : nullptr;
+    if (layer && layer->pct > 0) {
+        RECT filled = di->rcItem;
+        filled.right = filled.left + MulDiv(filled.right - filled.left, layer->pct, 100);
+        HBRUSH green = CreateSolidBrush(sel ? RGB(20, 111, 51) : RGB(201, 237, 207));
+        FillRect(di->hDC, &filled, green);
+        DeleteObject(green);
+    }
     SetBkMode(di->hDC, TRANSPARENT);
     HGDIOBJ old = SelectObject(di->hDC, S.font);
     RECT r = di->rcItem;
@@ -1645,17 +2433,14 @@ void drawListItem(DRAWITEMSTRUCT* di) {
     bool noHeader = has && layer->noHeader;
     drawChip(di->hDC, headerChipRect(di->rcItem), noHeader ? L"Header: off" : L"Header: on", sel, false,
              noHeader ? RGB(0xc6, 0x28, 0x28) : RGB(0x20, 0x20, 0x20));
-    drawChip(di->hDC, unitChipRect(di->rcItem), kUnitShort[unit], sel, true, RGB(0x20, 0x20, 0x20));
-    if (has && layer->total > 0) {
-        RECT back{di->rcItem.left + dp(8), di->rcItem.top + dp(52), di->rcItem.right - dp(8), di->rcItem.top + dp(56)};
-        HBRUSH bg = CreateSolidBrush(RGB(0xe0, 0xe0, 0xe0));
-        FillRect(di->hDC, &back, bg);
-        DeleteObject(bg);
-        RECT fill = back;
-        fill.right = back.left + static_cast<int>(static_cast<double>(back.right - back.left) * layer->pct / 100.0);
-        HBRUSH fg = CreateSolidBrush(kBarGreen);
-        FillRect(di->hDC, &fill, fg);
-        DeleteObject(fg);
+    RECT unitRect = unitChipRect(di->rcItem);
+    drawChip(di->hDC, unitRect, kUnitShort[unit], sel, true, RGB(0x20, 0x20, 0x20));
+    if (di->itemID < S.boxes.size() && S.boxes[di->itemID]) {
+        const auto length = formatLength(selectedLength(di->itemID));
+        RECT lengthRect{unitRect.right + dp(6), unitRect.top, di->rcItem.right - dp(8), unitRect.bottom};
+        SetTextColor(di->hDC, sel ? GetSysColor(COLOR_HIGHLIGHTTEXT) : kInk);
+        DrawTextW(di->hDC, length.c_str(), -1, &lengthRect,
+                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
     SelectObject(di->hDC, old);
 }
@@ -1668,15 +2453,176 @@ void applyRange() {
     Layer& l = S.layers[static_cast<size_t>(i)];
     l.from = std::max(0.0, std::min(100.0, readField(S.editFrom)));
     l.to = GetWindowTextLengthW(S.editTo) == 0 ? 100.0 : std::max(0.0, std::min(100.0, readField(S.editTo)));
+    invalidateRow(i);
     rebuildView();
+}
+
+INT_PTR CALLBACK historyDialog(HWND dialog, UINT msg, WPARAM wParam, LPARAM lParam);
+
+INT_PTR CALLBACK ServerConfigProc(HWND dialog, UINT msg, WPARAM wParam, LPARAM) {
+    if (msg == WM_INITDIALOG) {
+        const auto set = [&](int id, double value) {
+            wchar_t number[48];
+            swprintf(number, std::size(number), L"%.8g", value);
+            SetDlgItemTextW(dialog, id, number);
+        };
+        set(IDC_PAPER_WIDTH, readField(S.edit) * 10);
+        set(IDC_RIGHT_MARGIN, S.cfg.rightMarginMm);
+        set(IDC_SPACING, S.cfg.spacingMm);
+        SetDlgItemInt(dialog, IDC_SHIFT, S.cfg.shift, TRUE);
+        CheckRadioButton(dialog, IDC_MONO, IDC_BIDI, S.cfg.bidi ? IDC_BIDI : IDC_MONO);
+        CheckRadioButton(dialog, IDC_ROTATE_0, IDC_ROTATE_180,
+            S.cfg.rotation == 90 ? IDC_ROTATE_AUTO : S.cfg.rotation == 180 ? IDC_ROTATE_180 : IDC_ROTATE_0);
+        for (const int id : {IDC_TEST_LINES, IDC_TEST_SQUARES})
+            EnableWindow(GetDlgItem(dialog, id), canPrint());
+        return TRUE;
+    }
+    if (msg != WM_COMMAND) return FALSE;
+    if (LOWORD(wParam) == IDCANCEL) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+    }
+    if (LOWORD(wParam) == IDC_CONFIG_CALIBRATE) {
+        showCalibration(dialog);
+        return TRUE;
+    }
+    if (LOWORD(wParam) == IDC_PLOT_HISTORY) {
+        DialogBoxParamW(S.inst, MAKEINTRESOURCEW(IDD_PLOT_HISTORY), dialog, historyDialog, 0);
+        return TRUE;
+    }
+    if (LOWORD(wParam) == IDC_TEST_LINES || LOWORD(wParam) == IDC_TEST_SQUARES) {
+        EndDialog(dialog, LOWORD(wParam));
+        return TRUE;
+    }
+    if (LOWORD(wParam) != IDOK) return FALSE;
+
+    const auto read = [&](int id) {
+        wchar_t field[48]{};
+        GetDlgItemTextW(dialog, id, field, static_cast<int>(std::size(field)));
+        std::replace(field, field + std::wcslen(field), L',', L'.');
+        wchar_t* end = nullptr;
+        const double value = std::wcstod(field, &end);
+        return end != field && *end == L'\0' && std::isfinite(value) ? value : -1.0;
+    };
+    const double width = read(IDC_PAPER_WIDTH);
+    const double margin = read(IDC_RIGHT_MARGIN);
+    const double spacing = read(IDC_SPACING);
+    BOOL validShift = FALSE;
+    const int shift = static_cast<int>(GetDlgItemInt(dialog, IDC_SHIFT, &validShift, TRUE));
+    if (width <= 0 || width > 10000 || margin < 0 || margin >= width ||
+        spacing < 0 || spacing > 10000 || !validShift || shift < -32768 || shift > 32767) {
+        MessageBoxW(dialog, L"Enter valid millimeter values, a right margin smaller than the paper width, and a whole-number shift.",
+                    L"Configuration", MB_OK | MB_ICONWARNING);
+        return TRUE;
+    }
+    S.cfg.rightMarginMm = margin;
+    S.cfg.spacingMm = spacing;
+    S.cfg.shift = shift;
+    S.cfg.bidi = IsDlgButtonChecked(dialog, IDC_BIDI) == BST_CHECKED;
+    S.cfg.rotation = IsDlgButtonChecked(dialog, IDC_ROTATE_AUTO) == BST_CHECKED ? 90 :
+                     IsDlgButtonChecked(dialog, IDC_ROTATE_180) == BST_CHECKED ? 180 : 0;
+    const auto save = [&](const wchar_t* key, double value) {
+        wchar_t number[48];
+        swprintf(number, std::size(number), L"%.8g", value);
+        WritePrivateProfileStringW(L"Plotter", key, number, S.cfg.ini.c_str());
+        return std::wstring(number);
+    };
+    save(L"RightMarginMm", margin);
+    save(L"SpacingMm", spacing);
+    save(L"ShiftMm", shift);
+    save(L"Bidi", S.cfg.bidi);
+    save(L"Rotation", S.cfg.rotation);
+    SetWindowTextW(S.edit, save(L"WidthCm", width / 10).c_str());
+    rebuildView();
+    EndDialog(dialog, IDOK);
+    return TRUE;
+}
+
+void requestMaintenance(MaintenanceAction action) {
+    if (!canPrint()) return;
+    S.maintenanceRunning = true;
+    updatePrintButton();
+    EnableWindow(S.btnTestUsb, FALSE);
+    setStatus(action == MaintenanceAction::CleanHeads ? L"Cleaning VEGA heads..." : L"Advancing paper...", false);
+    g_maintenance.store(action);
+}
+
+std::filesystem::path printHistoryPath() {
+    return std::filesystem::path(S.cfg.ini).parent_path() / L"Ralvioli Plotter.history.txt";
+}
+
+void appendPrintHistory(const std::wstring& title, const std::wstring& outcome, int pct) {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t date[32];
+    std::swprintf(date, std::size(date), L"%04u-%02u-%02u %02u:%02u",
+                  static_cast<unsigned>(now.wYear), static_cast<unsigned>(now.wMonth),
+                  static_cast<unsigned>(now.wDay), static_cast<unsigned>(now.wHour), static_cast<unsigned>(now.wMinute));
+    std::ofstream stream(printHistoryPath(), std::ios::binary | std::ios::app);
+    stream << utf8(std::wstring(date) + L"  " + title + L"  " + outcome + L"  " + std::to_wstring(pct) + L"%") << "\r\n";
+}
+
+INT_PTR CALLBACK historyDialog(HWND dialog, UINT msg, WPARAM wParam, LPARAM) {
+    if (msg == WM_INITDIALOG) {
+        std::ifstream input(printHistoryPath(), std::ios::binary);
+        if (input) {
+            SetDlgItemTextW(dialog, IDC_HISTORY_TEXT, wide(std::string(std::istreambuf_iterator<char>(input), {})).c_str());
+        } else {
+            SetDlgItemTextW(dialog, IDC_HISTORY_TEXT, L"No Ralvioli print history yet.");
+        }
+        return TRUE;
+    }
+    if (msg == WM_COMMAND && LOWORD(wParam) == IDCANCEL) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void startMaintenancePattern(bool squares) {
+    if (!canPrint()) return;
+    const auto width = paperUnits();
+    if (!width || *width < 4000) {
+        setStatus(L"Test patterns require at least 100 mm of printable width.", true);
+        return;
+    }
+    Job job;
+    job.index = -2;
+    job.title = squares ? L"VEGA test squares" : L"VEGA test lines";
+    const auto path = [&](std::initializer_list<rm::Pt> points) {
+        rm::Op move(rm::K::Pts);
+        move.verb = "PU";
+        move.pts = {*points.begin()};
+        job.piece.ops.push_back(std::move(move));
+        rm::Op draw(rm::K::Pts);
+        draw.verb = "PD";
+        draw.pts.assign(points.begin() + 1, points.end());
+        job.piece.ops.push_back(std::move(draw));
+    };
+    for (int i = 0; i < 5; ++i) {
+        const double y = i * 800.0;
+        if (squares) path({{0, y}, {600, y}, {600, y + 600}, {0, y + 600}, {0, y}});
+        else path({{0, y}, {4000, y}});
+    }
+    job.stream = rp::makeStream(job.piece, kHpglOutputStepMm, S.calibration);
+    job.plan = rp::makePlan(job.stream, 0, 100);
+    std::vector<Job> jobs;
+    jobs.push_back(std::move(job));
+    startVegaJobs(std::move(jobs), *width);
 }
 
 LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_DROPFILES:
+            addDroppedFiles(reinterpret_cast<HDROP>(wParam));
+            return 0;
         case WM_CREATE:
             S.hwnd = hwnd;
             S.updating = true;
             createControls(hwnd);
+            DragAcceptFiles(hwnd, TRUE);
+            DragAcceptFiles(S.list, TRUE);
+            DragAcceptFiles(S.preview, TRUE);
             S.updating = false;
             updateUsbStatus();
             SetTimer(hwnd, kUsbStatusTimer, 2000, nullptr);
@@ -1724,7 +2670,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
                 case ID_ADD:
-                    addFiles();
+                    addFiles(pickFiles());
                     break;
                 case ID_REMOVE:
                     removeSelected();
@@ -1738,14 +2684,43 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_FIT:
                     fitAll();
                     break;
+                case ID_PRINT_AUTO:
+                    if (HIWORD(wParam) == BN_CLICKED) {
+                        fitAll();
+                        rebuildView();
+                        showIndicators(S.statusWord);
+                    }
+                    break;
                 case ID_START:
                     startPrint();
                     break;
+                case ID_SERVER_CONFIG: {
+                    const auto action = DialogBoxParamW(S.inst, MAKEINTRESOURCEW(IDD_SERVER_CONFIG),
+                                                        hwnd, ServerConfigProc, 0);
+                    if (action == IDC_TEST_LINES || action == IDC_TEST_SQUARES)
+                        startMaintenancePattern(action == IDC_TEST_SQUARES);
+                    break;
+                }
+                case ID_ADVANCE_PAPER:
+                    requestMaintenance(MaintenanceAction::AdvancePaper);
+                    break;
+                case ID_CLEAN_HEADS:
+                    requestMaintenance(MaintenanceAction::CleanHeads);
+                    break;
                 case ID_TEST_USB:
-                    testUsb();
+                    if (!S.maintenanceRunning) testUsb();
+                    break;
+                case ID_PAUSE:
+                    if (S.running && !g_stop) {
+                        const bool pause = !g_pause;
+                        g_pause = pause;
+                        SetWindowTextW(S.btnPause, pause ? L"Resume" : L"Pause");
+                        setStatus(pause ? L"Pause requested." : L"Resume requested.", false);
+                    }
                     break;
                 case ID_STOP:
                     g_stop = true;
+                    EnableWindow(S.btnPause, FALSE);
                     setStatus(L"Stopping...", false);
                     break;
                 case ID_LIST:
@@ -1756,8 +2731,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_WIDTH:
                     if (HIWORD(wParam) == EN_CHANGE && S.preview && !S.updating) {
                         saveSettings();
-                        InvalidateRect(S.preview, nullptr, FALSE);
-                        showStatus();
+                        for (size_t i = 0; i < S.layers.size(); ++i) computeBox(i);
+                        InvalidateRect(S.list, nullptr, FALSE);
+                        rebuildView();
                     }
                     break;
                 case ID_FROM:
@@ -1765,9 +2741,6 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (HIWORD(wParam) == EN_CHANGE) {
                         applyRange();
                     }
-                    break;
-                case ID_CALIBRATE:
-                    showCalibration();
                     break;
                 default:
                     break;
@@ -1784,7 +2757,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             l.status = std::to_wstring(l.pct) + L"%";
             invalidateRow(static_cast<int>(i));
             if (!g_stop) {
-                setStatus(std::wstring(L"Rendering ") + baseName(l.path) +
+                setStatus(std::wstring(L"Printing ") + baseName(l.path) +
                           L" — " + std::to_wstring(l.pct) + L"%", false);
             }
             if (static_cast<int>(i) == S.shown) {
@@ -1793,6 +2766,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case kMsgDone: {
+            if (static_cast<int>(wParam) == -2) {
+                if (lParam == 0) setStatus(L"Test pattern finished.", false);
+                if (lParam == 1) setStatus(L"Test pattern stopped.", false);
+                return 0;
+            }
             if (static_cast<int>(wParam) == -1) {
                 const wchar_t* status = lParam == 0 ? L"Test rectangle submitted to Windows printer." :
                     lParam == 1 ? L"Test rectangle stopped." : L"Test rectangle failed. See Plotter status for details.";
@@ -1808,14 +2786,15 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (lParam == 0) {
                 l.pct = 100;
                 l.sent = l.total;
-                l.status = L"submitted";
-                setStatus(std::wstring(L"Submitted ") + baseName(l.path), false);
+                l.status = L"done";
+                setStatus(std::wstring(L"Finished ") + baseName(l.path), false);
             } else if (lParam == 1) {
                 l.status = L"stopped " + std::to_wstring(l.pct) + L"%";
                 setStatus(L"Stopped " + baseName(l.path) + L" at " + std::to_wstring(l.pct) + L"%", false);
             } else {
                 l.status = L"error";
             }
+            appendPrintHistory(baseName(l.path), l.status, l.pct);
             invalidateRow(static_cast<int>(i));
             if (static_cast<int>(i) == S.shown) {
                 InvalidateRect(S.preview, nullptr, FALSE);
@@ -1827,9 +2806,75 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             setStatus(wide(*s), true);
             return 0;
         }
+        case kMsgVegaRecovery:
+            S.recoveryRequired = wParam == 0;
+            if (!S.recoveryRequired && S.connectionThread &&
+                WaitForSingleObject(S.disconnect, 0) == WAIT_TIMEOUT) {
+                showIndicators(0);
+                setStatus(L"VEGA reset and connected", false);
+            }
+            return 0;
+        case kMsgPauseState:
+            if (S.running && !g_stop && g_pause == (wParam != 0))
+                setStatus(wParam ? L"Print paused." : L"Print resumed.", false);
+            return 0;
+        case kMsgPrintStatus:
+            if (S.running) showIndicators(static_cast<int>(lParam));
+            return 0;
+        case kMsgHeadCleanDone: {
+            std::unique_ptr<std::string> detail(reinterpret_cast<std::string*>(lParam));
+            S.maintenanceRunning = false;
+            EnableWindow(S.btnTestUsb, !S.running);
+            updatePrintButton();
+            const bool cleaning = (wParam & 2) != 0;
+            const bool ok = (wParam & 1) != 0;
+            if (ok) setStatus(cleaning ? L"VEGA head cleaning finished" : L"Paper advance finished", false);
+            else setStatus((cleaning ? L"VEGA head cleaning failed: " : L"Paper advance failed: ") + wide(*detail), true);
+            return 0;
+        }
         case kMsgUsbResult: {
-            std::unique_ptr<std::string> result(reinterpret_cast<std::string*>(lParam));
-            setStatus((wParam ? L"Plotter check passed: " : L"Plotter check failed: ") + wide(*result), !wParam);
+            if (wParam) {
+                if (S.connectionThread && WaitForSingleObject(S.disconnect, 0) == WAIT_TIMEOUT) {
+                    if (S.statusWord < 0 && !S.reconnectingAfterPrint) setStatus(L"VEGA connected", false);
+                    S.reconnectingAfterPrint = false;
+                    const int word = static_cast<int>(wParam - 1);
+                    if (word != S.statusWord) showIndicators(word);
+                    updatePrintButton();
+                }
+            } else {
+                std::unique_ptr<std::string> result(reinterpret_cast<std::string*>(lParam));
+                if (S.connectionThread) {
+                    WaitForSingleObject(S.connectionThread, INFINITE);
+                    CloseHandle(S.connectionThread);
+                    CloseHandle(S.disconnect);
+                    S.connectionThread = nullptr;
+                    S.disconnect = nullptr;
+                }
+                if (S.pendingPrint) {
+                    auto args = std::move(S.pendingPrint);
+                    if (!g_stop) {
+                        auto* raw = args.release();
+                        S.thread = CreateThread(nullptr, 0, vegaPrintThread, raw, 0, nullptr);
+                        if (S.thread) return 0;
+                        delete raw;
+                        setStatus(L"Could not start the VEGA print worker.", true);
+                    }
+                    PostMessageW(hwnd, kMsgFinished, 0, 0);
+                    return 0;
+                }
+                S.reconnectingAfterPrint = false;
+                S.maintenanceRunning = false;
+                g_maintenance.store(MaintenanceAction::None);
+                showIndicators(result && !result->empty() ? -2 : -1);
+                updatePrintButton();
+                SetWindowTextW(S.btnTestUsb, L"Connect");
+                EnableWindow(S.btnTestUsb, !S.running);
+                if (result && !result->empty()) {
+                    setStatus((S.recoveryRequired ? L"VEGA recovery failed: " : L"VEGA connection lost: ") +
+                              wide(*result), true);
+                }
+                else setStatus(L"VEGA disconnected", false);
+            }
             return 0;
         }
         case kMsgFinished:
@@ -1845,11 +2890,22 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     invalidateRow(static_cast<int>(i));
                 }
             }
+            showIndicators(S.statusWord == -2 ? -2 : -1);
             setRunning(false);
+            SetWindowTextW(S.btnTestUsb, L"Connect");
+            if (wParam && !g_stop) testUsb(true);
             updateUsbStatus();
             showStatus();
             return 0;
         case WM_CLOSE:
+            g_stop = true;
+            if (S.connectionThread) {
+                SetEvent(S.disconnect);
+                WaitForSingleObject(S.connectionThread, INFINITE);
+                MSG pending{};
+                while (PeekMessageW(&pending, hwnd, kMsgUsbResult, kMsgHeadCleanDone, PM_REMOVE))
+                    DispatchMessageW(&pending);
+            }
             if (S.running) {
                 g_stop = true;
                 if (S.thread != nullptr) {

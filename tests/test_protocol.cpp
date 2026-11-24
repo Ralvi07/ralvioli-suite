@@ -22,6 +22,18 @@ int main() {
     std::string big = proto::frame(0x20, std::string(300, 'x'));      // 16-bit length, big-endian
     assert(static_cast<unsigned char>(big[4]) == 0x01 && static_cast<unsigned char>(big[5]) == 0x2C);
 
+    // tuff.pcapng frames 46 and 48 use a sequence pair where legacy frames use 00 FF.
+    const char captured[] =
+        "\x1a\xe5\xe6\x19\x00\x40\xff\xbf\x00\x00\x00\x04\x3c\x91\xbb\x77"
+        "\x00\xac\x00\x00\x00\x01\x00\x00\x01\xbb\x00\x1a\xf6\xea\x00\x00"
+        "\x00\x00\x00\x01\xf0\x0f\x01\x02\xf0\x0f\x01\x02\x00\x00\x11\x3a"
+        "\x00\x04\x00\x00\x01\x01\x00\x01\x00\x00\x00\x00\xe6\xe8\xf3\xeb"
+        "\xc7\xff\xf9\xff\x75\xe7\x7b\xb4\x15\xae";
+    const std::string capturedHeader(captured, 8);
+    const std::string capturedBody(captured + 8, sizeof(captured) - 9);
+    assert(proto::checkHeader(capturedHeader, 0x1A, len, err) && len == 64);
+    assert(proto::checkBody(capturedHeader, capturedBody, err));
+
     // versions
     proto::Version v = proto::parseVersion("Ver.15.01.00");
     assert(v.valid && v.major == 15 && v.minor == 1 && v.patch == 0 && v.text() == "15.01.00");

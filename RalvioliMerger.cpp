@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "RalvioliCore.hpp"
+#include "PreviewNavigation.hpp"
 
 namespace {
 
@@ -95,7 +96,7 @@ struct State {
     double vs = 1.0;
     int cw = 0;
     int ch = 0;
-    bool panning = false;
+    UINT panButton = 0;
     POINT panLast{0, 0};
     std::wstring lastDir;
 };
@@ -304,7 +305,7 @@ void refreshList(int select) {
     updatePreview();
 }
 
-void fitView() {
+bool fitView(bool apply = true) {
     double minx = 0.0;
     double miny = 0.0;
     double maxx = 0.0;
@@ -329,9 +330,13 @@ void fitView() {
     maxy += pady;
     double m = dp(10);
     double sc = std::min((S.cw - 2 * m) / std::max(maxx - minx, 1.0), (S.ch - 2 * m) / std::max(maxy - miny, 1.0));
-    S.vx = minx;
-    S.vy = miny;
-    S.vs = clampScale(sc);
+    const double fitted = clampScale(sc);
+    if (apply) {
+        S.vx = minx;
+        S.vy = miny;
+        S.vs = fitted;
+    }
+    return S.vs > fitted * 1.001;
 }
 
 void ensureView() {
@@ -416,13 +421,13 @@ void cancelHold() {
     updatePreview();
 }
 
-void startPan(int x, int y) {
+void startPan(int x, int y, UINT releaseButton) {
     ensureView();
-    if (S.shapes.empty()) {
-        return;
-    }
+    if (S.shapes.empty() || S.panButton) return;
+    // Middle-button panning works at every zoom level and preserves edit mode.
     S.autoFit = false;
-    S.panning = true;
+    S.panButton = releaseButton;
+    KillTimer(S.preview, preview::hoverTimer);
     S.panLast = POINT{x, y};
     SetCapture(S.preview);
 }
@@ -453,7 +458,7 @@ void onLeftDown(int x, int y) {
         }
     }
     if (hit < 0) {
-        startPan(x, y);
+        startPan(x, y, WM_LBUTTONUP);
         return;
     }
     S.snapDeg.clear();
@@ -475,7 +480,7 @@ void onLeftDown(int x, int y) {
 }
 
 void onMove(int x, int y) {
-    if (S.panning) {
+    if (S.panButton) {
         S.vx -= (x - S.panLast.x) / S.vs;
         S.vy += (y - S.panLast.y) / S.vs;
         S.panLast = POINT{x, y};
@@ -614,6 +619,15 @@ void drawScene(HDC dc, int w, int h) {
     }
 }
 
+bool previewZoomed() {
+    return !S.shapes.empty() && !S.autoFit && fitView(false);
+}
+
+int hitPreviewArrow(POINT mouse) {
+    if (S.panButton || S.holding >= 0 || !previewZoomed()) return -1;
+    return preview::hitArrow(mouse, S.cw, S.ch, dp);
+}
+
 LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_ERASEBKGND:
@@ -631,6 +645,7 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 HGDIOBJ old = SelectObject(mem, bmp);
                 FillRect(mem, &rc, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
                 drawScene(mem, w, h);
+                if (previewZoomed()) preview::drawArrows(mem, w, h, dp);
                 BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
                 SelectObject(mem, old);
                 DeleteObject(bmp);
@@ -640,29 +655,49 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         case WM_LBUTTONDOWN:
+            if (S.panButton || hitPreviewArrow({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}) >= 0) return 0;
             SetFocus(hwnd);
             onLeftDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             return 0;
         case WM_MBUTTONDOWN:
             SetFocus(hwnd);
-            startPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            startPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), WM_MBUTTONUP);
             return 0;
         case WM_RBUTTONDOWN:
             onRightDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             return 0;
         case WM_LBUTTONUP:
         case WM_MBUTTONUP:
-            if (S.panning) {
-                S.panning = false;
+            if (S.panButton == msg) {
+                S.panButton = 0;
                 ReleaseCapture();
             }
             return 0;
         case WM_CAPTURECHANGED:
-            S.panning = false;
+            S.panButton = 0;
             return 0;
-        case WM_MOUSEMOVE:
-            onMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        case WM_MOUSEMOVE: {
+            const POINT mouse{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (hitPreviewArrow(mouse) >= 0) SetTimer(hwnd, preview::hoverTimer, 25, nullptr);
+            else {
+                KillTimer(hwnd, preview::hoverTimer);
+                onMove(mouse.x, mouse.y);
+            }
             return 0;
+        }
+        case WM_TIMER: {
+            if (wParam != preview::hoverTimer) break;
+            const int arrow = preview::hoveredArrow(hwnd, hitPreviewArrow);
+            if (arrow < 0) {
+                KillTimer(hwnd, preview::hoverTimer);
+                return 0;
+            }
+            const POINT direction = preview::previewDirections[arrow];
+            S.vx += direction.x * dp(10) / S.vs;
+            S.vy -= direction.y * dp(10) / S.vs;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         case WM_MOUSEWHEEL: {
             POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ScreenToClient(hwnd, &p);
@@ -671,7 +706,11 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         case WM_SETCURSOR:
             if (LOWORD(lParam) == HTCLIENT) {
-                SetCursor(LoadCursorW(nullptr, (S.holding >= 0 || S.panning) ? kCursorMove : kCursorArrow));
+                if (preview::hoveredArrow(hwnd, hitPreviewArrow) >= 0) {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
+                SetCursor(LoadCursorW(nullptr, (S.holding >= 0 || S.panButton) ? kCursorMove : kCursorArrow));
                 return TRUE;
             }
             break;

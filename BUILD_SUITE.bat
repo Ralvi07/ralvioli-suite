@@ -18,7 +18,7 @@ set "FLAGS=-std=c++17 -O2 -s -DUNICODE -D_UNICODE -mwindows -static -static-libg
 set "LIBS=-lcomdlg32 -lgdi32 -lcomctl32 -luser32"
 call :build Merger "" || exit /b 1
 call :build Viewer "-lshell32" || exit /b 1
-call :build Plotter "-lsetupapi -lwinusb" || exit /b 1
+call :build Plotter "-lsetupapi -lwinusb -lshell32" || exit /b 1
 "%ISCC%" RalvioliSuite_installer.iss || exit /b 1
 echo Built build\Ralvioli Suite Setup.exe
 exit /b 0

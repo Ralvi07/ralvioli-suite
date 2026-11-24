@@ -10,7 +10,7 @@ struct Transport {
     virtual ~Transport() {}
     virtual bool open(std::string& err) = 0;
     virtual std::string description() const { return {}; }
-    // 0 = ok, 1 = timeout (done may be partial), -1 = error
+    // 0 = ok, 1 = timeout, 2 = busy, -1 = error. Check the transferred count on failure.
     virtual int write(const unsigned char* p, size_t n, size_t& done, std::string& err) = 0;
     virtual bool read(unsigned char* p, size_t n, size_t& done, std::string& err) = 0;
     virtual void close() {}
@@ -60,7 +60,6 @@ struct LibUsbKTransport : Transport {
     typedef BOOL(WINAPI* QueryPipeFn)(void*, UCHAR, UCHAR, UsbPipeInfo*);
     typedef BOOL(WINAPI* WriteFn)(void*, UCHAR, PUCHAR, UINT, UINT*, LPOVERLAPPED);
     typedef BOOL(WINAPI* PolicyFn)(void*, UCHAR, UINT, UINT, PVOID);
-    typedef BOOL(WINAPI* ResetFn)(void*, UCHAR);
 
     UINT vid;
     UINT pid;
@@ -83,7 +82,6 @@ struct LibUsbKTransport : Transport {
     WriteFn writePipe = nullptr;
     WriteFn readPipe = nullptr;
     PolicyFn setPolicy = nullptr;
-    ResetFn resetPipe = nullptr;
     std::string info;
 
     LibUsbKTransport(UINT v, UINT p, int pipeId, int tmo) : vid(v), pid(p), forcePipe(pipeId), timeoutMs(tmo) {}
@@ -109,7 +107,7 @@ struct LibUsbKTransport : Transport {
             !load(lstFind, "LstK_FindByVidPid", err) || !load(usbInit, "UsbK_Init", err) ||
             !load(usbFree, "UsbK_Free", err) || !load(queryIf, "UsbK_QueryInterfaceSettings", err) ||
             !load(queryPipe, "UsbK_QueryPipe", err) || !load(writePipe, "UsbK_WritePipe", err) ||
-            !load(readPipe, "UsbK_ReadPipe", err) || !load(setPolicy, "UsbK_SetPipePolicy", err) || !load(resetPipe, "UsbK_ResetPipe", err)) {
+            !load(readPipe, "UsbK_ReadPipe", err) || !load(setPolicy, "UsbK_SetPipePolicy", err)) {
             return false;
         }
         if (!lstInit(&list, 0)) {
@@ -164,9 +162,21 @@ struct LibUsbKTransport : Transport {
         return true;
     }
 
+    bool enableRasterEndpoints(std::string& error) {
+        UINT timeout = static_cast<UINT>(timeoutMs);
+        if (setPolicy(h, 0x02, 0x03, sizeof(timeout), &timeout) &&
+            setPolicy(h, 0x82, 0x03, sizeof(timeout), &timeout)) return true;
+        error = "Could not configure VEGA raster endpoints: " + winErrorText(GetLastError());
+        return false;
+    }
+
     int write(const unsigned char* p, size_t n, size_t& done, std::string& err) override {
+        return writeEndpoint(pipe, p, n, done, err);
+    }
+
+    int writeEndpoint(UCHAR endpoint, const unsigned char* p, size_t n, size_t& done, std::string& err) {
         UINT got = 0;
-        BOOL ok = writePipe(h, pipe, const_cast<PUCHAR>(p), static_cast<UINT>(n), &got, nullptr);
+        BOOL ok = writePipe(h, endpoint, const_cast<PUCHAR>(p), static_cast<UINT>(n), &got, nullptr);
         done = got;
         if (ok) {
             return 0;
@@ -176,14 +186,17 @@ struct LibUsbKTransport : Transport {
             err = "libusbK transfer timed out: " + winErrorText(e);
             return 1;
         }
-        resetPipe(h, pipe);
         err = "libusbK transfer failed: " + winErrorText(e);
-        return -1;
+        return e == ERROR_BUSY ? 2 : -1;
     }
 
     bool read(unsigned char* p, size_t n, size_t& done, std::string& err) override {
+        return readEndpoint(pipeIn, p, n, done, err);
+    }
+
+    bool readEndpoint(UCHAR endpoint, unsigned char* p, size_t n, size_t& done, std::string& err) {
         UINT got = 0;
-        const BOOL ok = readPipe(h, pipeIn, p, static_cast<UINT>(n), &got, nullptr);
+        const BOOL ok = readPipe(h, endpoint, p, static_cast<UINT>(n), &got, nullptr);
         done = got;
         if (!ok) err = "libusbK read failed: " + winErrorText(GetLastError());
         return ok != FALSE;
