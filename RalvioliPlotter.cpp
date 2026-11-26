@@ -119,6 +119,8 @@ struct Settings {
     int pipe = 1;
     int pipeIn = 129;
     double lineWidthMm = 2.0;
+    double textWidthMm = 0.0;
+    double labelSizePercent = 100.0;
     double rightMarginMm = 55;
     double paperWidthCm = 195;
     double spacingMm = 10;
@@ -368,6 +370,16 @@ void loadSettings() {
     S.cfg.pipe = static_cast<int>(std::wcstol(iniText(L"Pipe", L"1").c_str(), nullptr, 10));
     S.cfg.pipeIn = GetPrivateProfileIntW(L"Plotter", L"PipeIn", 129, S.cfg.ini.c_str());
     S.cfg.lineWidthMm = std::clamp(positiveNumber(iniText(L"LineWidthMm", L"2")).value_or(2.0), 0.01, 5.0);
+    const auto textOffset = iniText(L"TextStrokeOffsetMm", L"0");
+    wchar_t* textEnd = nullptr;
+    const double offset = std::wcstod(textOffset.c_str(), &textEnd);
+    if (textEnd != textOffset.c_str() && *textEnd == L'\0' && offset >= -5 && offset <= 5)
+        S.cfg.textWidthMm = offset;
+    const auto labelSize = iniText(L"LabelSizePercent", L"100");
+    wchar_t* labelEnd = nullptr;
+    const double percent = std::wcstod(labelSize.c_str(), &labelEnd);
+    if (labelEnd != labelSize.c_str() && *labelEnd == L'\0' && percent >= 0 && percent <= 1000)
+        S.cfg.labelSizePercent = percent;
     S.cfg.timeoutMs = std::clamp(std::wcstol(iniText(L"TimeoutMs", L"2000").c_str(), nullptr, 10), 100L, 60000L);
     S.cfg.backend = iniText(L"Backend", L"Auto");
     S.cfg.rightMarginMm = std::max(0.0, std::wcstod(iniText(L"RightMarginMm", L"55").c_str(), nullptr));
@@ -1024,7 +1036,6 @@ void drawScene(HDC dc, int w, int h) {
     HGDIOBJ oldPen = GetCurrentObject(dc, OBJ_PEN);
     SetBkMode(dc, TRANSPARENT);
     SetTextAlign(dc, TA_BASELINE | TA_LEFT);
-    std::map<std::pair<int, int>, HFONT> fonts;
     std::vector<POINT> run;
     const auto drawRange = [&](const auto& items, int x0, int x1, COLORREF ink, int penWidth) {
         if (x1 <= x0) return;
@@ -1034,6 +1045,9 @@ void drawScene(HDC dc, int w, int h) {
         HPEN pen = CreatePen(PS_SOLID, penWidth, ink);
         SelectObject(dc, pen);
         SetTextColor(dc, ink);
+        const double textMm = plotTextWidth(S.cfg.lineWidthMm, S.cfg.textWidthMm);
+        const int textPixels = std::max(1, static_cast<int>(std::lround(penWidth * textMm / S.cfg.lineWidthMm)));
+        HPEN textPen = S.cfg.labelSizePercent > 0 && textMm > 0 ? CreatePen(PS_SOLID, textPixels, ink) : nullptr;
         for (const auto& item : items) {
             if (item.type == 0) {
                 run.clear();
@@ -1042,28 +1056,19 @@ void drawScene(HDC dc, int w, int h) {
             } else if (item.type == 1) {
                 const double r = item.r;
                 Ellipse(dc, plotX(item.c.x-r), plotY(item.c.y+r), plotX(item.c.x+r), plotY(item.c.y-r));
-            } else {
-                const int size = std::max(7, std::min(400, static_cast<int>(item.height * sc)));
-                const int angle = static_cast<int>(std::lround(std::atan2(item.dy, item.dx) * 1800 / 3.14159265358979323846));
-                const std::pair<int, int> key{size, angle};
-                auto found = fonts.find(key);
-                if (found == fonts.end()) {
-                    HFONT font = CreateFontW(-size, 0, angle, angle, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                             OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-                    found = fonts.emplace(key, font).first;
-                }
-                SelectObject(dc, found->second);
-                TextOutA(dc, plotX(item.c.x), plotY(item.c.y), item.text.c_str(), static_cast<int>(item.text.size()));
+            } else if (textPen) {
+                const double height = std::clamp(std::abs(item.height) * sc * (S.cfg.labelSizePercent / 100), 1.0, 4096.0);
+                drawPlotText(dc, plotX(item.c.x), plotY(item.c.y), item.text, height,
+                             -std::atan2(item.dy, item.dx), textPen);
             }
         }
         RestoreDC(dc, saved);
         DeleteObject(pen);
+        if (textPen) DeleteObject(textPen);
     };
     const auto restoreDrawing = [&] {
         SelectObject(dc, oldBrush);
         SelectObject(dc, oldPen);
-        for (const auto& entry : fonts) DeleteObject(entry.second);
     };
     if (showingQueue()) {
         for (const auto& drawing : S.queueDrawings) {
@@ -2317,7 +2322,8 @@ DWORD WINAPI vegaPrintThread(LPVOID p) {
                 } else {
                     auto raster = vega::rasterize(job.piece, job.stream, job.plan, args->calibration,
                         args->paperWidth * 0.025, args->cfg.rightMarginMm, args->cfg.spacingMm,
-                        args->cfg.lineWidthMm, utf8(job.title), g_stop, args->cfg.bidi, job.range, args->cfg.shift, args->cfg.heads);
+                        args->cfg.lineWidthMm, utf8(job.title), g_stop, args->cfg.bidi, job.range, args->cfg.shift, args->cfg.heads,
+                        args->cfg.textWidthMm, args->cfg.labelSizePercent / 100);
                     prepared.data.record = std::move(raster.record);
                     prepared.data.bandCount = raster.bandCount;
                     prepared.data.encodeBand = std::move(raster.encodeBand);
@@ -2455,7 +2461,8 @@ DWORD WINAPI printThread(LPVOID p) {
             const int dpi = std::clamp(std::max(GetDeviceCaps(a->printer, LOGPIXELSX),
                                                GetDeviceCaps(a->printer, LOGPIXELSY)), 75, 600);
             submitted = printPlot(job.piece, job.stream, job.plan, a->calibration, a->paperWidth,
-                                  dpi, a->cfg.lineWidthMm, a->printer, job.title, g_stop, error);
+                                  dpi, a->cfg.lineWidthMm, a->printer, job.title, g_stop, error,
+                                  a->cfg.textWidthMm, a->cfg.labelSizePercent / 100);
         } catch (const std::exception& e) {
             error = e.what();
         }
@@ -3228,6 +3235,13 @@ INT_PTR CALLBACK ServerConfigProc(HWND dialog, UINT msg, WPARAM wParam, LPARAM) 
         set(IDC_SPACING, S.cfg.spacingMm);
         set(IDC_SHIFT, S.cfg.shift);
         set(IDC_LINE_WIDTH, S.cfg.lineWidthMm);
+        const bool labelsOff = S.cfg.labelSizePercent == 0 ||
+                               plotTextWidth(S.cfg.lineWidthMm, S.cfg.textWidthMm) == 0;
+        set(IDC_LABEL_SIZE, labelsOff ? 0 : S.cfg.labelSizePercent);
+        if (labelsOff)
+            SetDlgItemTextW(dialog, IDC_TEXT_WIDTH, L"Off");
+        else
+            set(IDC_TEXT_WIDTH, S.cfg.textWidthMm);
         for (unsigned slot = 0; slot < vega::headSlots; ++slot) {
             CheckDlgButton(dialog, IDC_HEAD_1 + kPhysicalHeadForSlot[slot] - 1, S.cfg.heads.enabled(slot) ? BST_CHECKED : BST_UNCHECKED);
             set(IDC_HEAD_1_OFFSET + kPhysicalHeadForSlot[slot] - 1, S.cfg.heads.offsetMm[slot]);
@@ -3253,8 +3267,6 @@ INT_PTR CALLBACK ServerConfigProc(HWND dialog, UINT msg, WPARAM wParam, LPARAM) 
         return TRUE;
     }
     const auto action = LOWORD(wParam);
-    if (action != IDOK && action != IDC_TEST_LINES && action != IDC_TEST_SQUARES) return FALSE;
-
     const auto read = [&](int id) {
         wchar_t field[48]{};
         GetDlgItemTextW(dialog, id, field, static_cast<int>(std::size(field)));
@@ -3263,6 +3275,43 @@ INT_PTR CALLBACK ServerConfigProc(HWND dialog, UINT msg, WPARAM wParam, LPARAM) 
         const double value = std::wcstod(field, &end);
         return end != field && *end == L'\0' && std::isfinite(value) ? value : std::numeric_limits<double>::quiet_NaN();
     };
+    const auto readOffset = [&] {
+        wchar_t field[48]{};
+        GetDlgItemTextW(dialog, IDC_TEXT_WIDTH, field, static_cast<int>(std::size(field)));
+        return _wcsicmp(field, L"Off") == 0 ? -5.0 : read(IDC_TEXT_WIDTH);
+    };
+    const auto synchronizeLabels = [&](int changed) {
+        const double line = read(IDC_LINE_WIDTH);
+        const double offset = readOffset();
+        const double size = read(IDC_LABEL_SIZE);
+        if (!(line >= 0.01 && line <= 5 && offset >= -5 && offset <= 5 &&
+              size >= 0 && size <= 1000)) return;
+        const bool strokeOff = plotTextWidth(line, offset) == 0;
+        if ((changed == IDC_LABEL_SIZE && size == 0) ||
+            (changed != IDC_LABEL_SIZE && strokeOff)) {
+            SetDlgItemTextW(dialog, IDC_TEXT_WIDTH, L"Off");
+            SetDlgItemTextW(dialog, IDC_LABEL_SIZE, L"0");
+        } else if (changed == IDC_LABEL_SIZE && strokeOff) {
+            SetDlgItemTextW(dialog, IDC_TEXT_WIDTH, L"0");
+        } else if (changed == IDC_TEXT_WIDTH && size == 0) {
+            SetDlgItemTextW(dialog, IDC_LABEL_SIZE, L"100");
+        }
+    };
+    if (HIWORD(wParam) == EN_KILLFOCUS &&
+        (action == IDC_LABEL_SIZE || action == IDC_TEXT_WIDTH || action == IDC_LINE_WIDTH)) {
+        const HWND edit = GetDlgItem(dialog, action);
+        if (SendMessageW(edit, EM_GETMODIFY, 0, 0)) {
+            synchronizeLabels(action);
+            SendMessageW(edit, EM_SETMODIFY, FALSE, 0);
+        }
+        return TRUE;
+    }
+    if (action != IDOK && action != IDC_TEST_LINES && action != IDC_TEST_SQUARES) return FALSE;
+    const int focused = GetDlgCtrlID(GetFocus());
+    if (focused == IDC_LABEL_SIZE || focused == IDC_TEXT_WIDTH || focused == IDC_LINE_WIDTH) {
+        if (SendMessageW(GetFocus(), EM_GETMODIFY, 0, 0)) synchronizeLabels(focused);
+    }
+
     const double width = S.cfg.paperWidthCm * 10;
     const double margin = read(IDC_RIGHT_MARGIN);
     const double spacing = read(IDC_SPACING);
@@ -3272,6 +3321,20 @@ INT_PTR CALLBACK ServerConfigProc(HWND dialog, UINT msg, WPARAM wParam, LPARAM) 
         MessageBoxW(dialog, L"Enter a line width between 0.01 and 5 mm.",
                     L"Configuration", MB_OK | MB_ICONWARNING);
         SetFocus(GetDlgItem(dialog, IDC_LINE_WIDTH));
+        return TRUE;
+    }
+    double textWidth = readOffset();
+    double labelSize = read(IDC_LABEL_SIZE);
+    if (!(textWidth >= -5 && textWidth <= 5)) {
+        MessageBoxW(dialog, L"Enter a text stroke offset from -5 to 5 mm, or Off.",
+                    L"Configuration", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(dialog, IDC_TEXT_WIDTH));
+        return TRUE;
+    }
+    if (!(labelSize >= 0 && labelSize <= 1000)) {
+        MessageBoxW(dialog, L"Enter a label size from 0 to 1000 percent.",
+                    L"Configuration", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(dialog, IDC_LABEL_SIZE));
         return TRUE;
     }
     if (!(margin >= 0 && margin < width &&
@@ -3302,6 +3365,13 @@ INT_PTR CALLBACK ServerConfigProc(HWND dialog, UINT msg, WPARAM wParam, LPARAM) 
     S.cfg.spacingMm = spacing;
     S.cfg.shift = shift;
     S.cfg.lineWidthMm = lineWidth;
+    if (labelSize == 0 || plotTextWidth(lineWidth, textWidth) == 0) {
+        labelSize = 0;
+        textWidth = -5.0;
+        SetDlgItemTextW(dialog, IDC_TEXT_WIDTH, L"Off");
+    }
+    S.cfg.textWidthMm = textWidth;
+    S.cfg.labelSizePercent = labelSize;
     S.cfg.bidi = IsDlgButtonChecked(dialog, IDC_BIDI) == BST_CHECKED;
     S.cfg.rotation = IsDlgButtonChecked(dialog, IDC_ROTATE_AUTO) == BST_CHECKED ? 90 :
                      IsDlgButtonChecked(dialog, IDC_ROTATE_180) == BST_CHECKED ? 180 : 0;
@@ -3314,6 +3384,8 @@ INT_PTR CALLBACK ServerConfigProc(HWND dialog, UINT msg, WPARAM wParam, LPARAM) 
     save(L"SpacingMm", spacing);
     save(L"ShiftMm", shift);
     save(L"LineWidthMm", lineWidth);
+    save(L"TextStrokeOffsetMm", textWidth);
+    save(L"LabelSizePercent", labelSize);
     save(L"HeadMask", heads.mask);
     for (unsigned slot = 0; slot < vega::headSlots; ++slot) {
         const auto key = L"Head" + std::to_wstring(slot + 1) + L"OffsetMm";

@@ -2,7 +2,7 @@
 [Setup]
 AppId={{E2A9C4B1-7D3F-4B58-A6C2-91F0D5E8B3A7}
 AppName=Ralvioli Suite
-AppVersion=1.1.4
+AppVersion=1.1.5
 AppPublisher=Ralvioli
 DefaultDirName={autopf}\Ralvioli Suite
 DefaultGroupName=Ralvioli Suite

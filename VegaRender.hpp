@@ -2,6 +2,7 @@
 
 #include "VegaRaster.hpp"
 #include "PlotStream.hpp"
+#include "PlotText.hpp"
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -20,13 +21,6 @@ struct RasterSurface {
         if (labelPen) DeleteObject(labelPen);
     }
 };
-
-inline HFONT plotFont(const rp::DItem& item, double sy, int angle) {
-    const int size = static_cast<int>(std::clamp(std::round(std::abs(item.height) * sy), 1.0, 4096.0));
-    return CreateFontW(-size, 0, angle, angle, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                       OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
-                       DEFAULT_PITCH, L"Segoe UI");
-}
 
 struct FeedRange {
     double first;
@@ -55,7 +49,7 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
                            double spacingMm, double lineMm,
                            const std::string& title, const std::atomic_bool& stop, bool bidi = false,
                            std::optional<FeedRange> range = std::nullopt, double returnShiftMm = 0,
-                           HeadLayout heads = {}) {
+                           HeadLayout heads = {}, double textWidthMm = 0, double labelScale = 1) {
     const int bandRows = heads.bandRows();
     if (!bandRows || heads.mask >= (1u << headSlots)) throw std::runtime_error("Select at least one VEGA print head.");
     int firstHeadColumn = 0;
@@ -81,6 +75,9 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
     const double sx = 0.025 * calibration.across * columnsPerMm;
     const double sy = 0.025 * calibration.feed * rowsPerMm;
     const int stroke = std::max(1, static_cast<int>(std::lround(lineMm * columnsPerMm)));
+    const double textMm = plotTextWidth(lineMm, textWidthMm);
+    const int labelStroke = labelScale > 0 && textMm > 0 ? std::max(1, static_cast<int>(std::lround(textMm * columnsPerMm))) : 0;
+    int padding = stroke;
     std::vector<Mark> marks;
     double left = INFINITY, top = INFINITY, right = -INFINITY, bottom = -INFINITY;
     const auto gdi = std::make_shared<RasterSurface>();
@@ -106,24 +103,20 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
             const double radius = std::abs(item.r);
             include(item, 0, (item.c.y - radius) * sx, (item.c.x - radius) * sy,
                     (item.c.y + radius) * sx, (item.c.x + radius) * sy);
-        } else if (selected(item.line) && !item.text.empty()) {
-            HFONT font = plotFont(item, sy, 0);
-            if (!font) throw std::runtime_error("Could not create a font for a plot label.");
-            const HGDIOBJ previous = SelectObject(gdi->dc, font);
-            SIZE extent{};
-            const BOOL measured = GetTextExtentPoint32A(gdi->dc, item.text.c_str(), static_cast<int>(item.text.size()), &extent);
-            SelectObject(gdi->dc, previous);
-            DeleteObject(font);
-            if (!measured) throw std::runtime_error("Could not measure a plot label.");
+        } else if (labelStroke && selected(item.line) && !item.text.empty()) {
+            padding = std::max(padding, labelStroke);
+            const double height = std::clamp(std::abs(item.height) * sy * labelScale, 1.0, 4096.0);
             const double angle = std::atan2(item.dx * sy, item.dy * sx);
             const double x = item.c.y * sx;
             const double y = item.c.x * sy;
-            const double wX = extent.cx * std::cos(angle), wY = extent.cx * std::sin(angle);
-            const double hX = -extent.cy * std::sin(angle), hY = extent.cy * std::cos(angle);
-            include(item, 0, x + std::min(0.0, wX) + std::min(0.0, hX),
-                    y + std::min(0.0, wY) + std::min(0.0, hY),
-                    x + std::max(0.0, wX) + std::max(0.0, hX),
-                    y + std::max(0.0, wY) + std::max(0.0, hY));
+            const double width = item.text.size() * (5.0 / 6) * height;
+            const double wX = width * std::cos(angle), wY = width * std::sin(angle);
+            const double hX = height * std::sin(angle), hY = -height * std::cos(angle);
+            const double descX = -hX / 3, descY = -hY / 3;
+            include(item, 0, x + std::min(0.0, wX) + std::min(hX, descX),
+                    y + std::min(0.0, wY) + std::min(hY, descY),
+                    x + std::max(0.0, wX) + std::max(hX, descX),
+                    y + std::max(0.0, wY) + std::max(hY, descY));
         }
     }
     if (marks.empty()) throw std::runtime_error("The selected range contains no drawing.");
@@ -137,10 +130,11 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
     constexpr double maxLengthMm = 100000;
     if (!std::isfinite(width) || !std::isfinite(length))
         throw std::runtime_error("The selected drawing has invalid coordinates.");
-    if (width > paperMm * columnsPerMm + 1.0 || width > 24000) {
+    const double checkedWidth = width + (padding - stroke);
+    if (checkedWidth > paperMm * columnsPerMm + 1.0 || checkedWidth > 24000) {
         char detail[128];
         snprintf(detail, sizeof(detail), "Raster width %.1f mm exceeds the %.1f mm printable width.",
-                 width / columnsPerMm, std::min(paperMm, 24000 / columnsPerMm));
+                 checkedWidth / columnsPerMm, std::min(paperMm, 24000 / columnsPerMm));
         throw std::runtime_error(detail);
     }
     if (length > maxLengthMm * rowsPerMm + 0.01)
@@ -149,8 +143,8 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
         rightMarginMm < 0 || !std::isfinite(rightMarginMm) || rightMarginMm > 10000)
         throw std::runtime_error("The VEGA spacing or right margin is invalid.");
 
-    const int inkColumns = static_cast<int>(std::ceil(width)) + stroke + 1;
-    const int inkRows = static_cast<int>(std::ceil(length - 1e-7)) + (range ? 0 : stroke + 1);
+    const int inkColumns = static_cast<int>(std::ceil(width)) + padding + 1;
+    const int inkRows = static_cast<int>(std::ceil(length - 1e-7)) + (range ? 0 : padding + 1);
     const int bandCount = (inkRows + bandRows - 1) / bandRows;
     // Columns increase away from the configured right margin. Add room on
     // the right before reversing the return band's column order.
@@ -159,8 +153,8 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
     const int leadingColumns = std::max(0, -shift) - firstHeadColumn;
     const double margin = rightMarginMm - leadingColumns / columnsPerMm;
     const int extraLeftColumns = std::max(0, shift);
-    if (margin < 0 || (extraLeftColumns > 0 && width + extraLeftColumns > paperMm * columnsPerMm + 1.0) ||
-        (shift != 0 && width + std::abs(shift) > 24000))
+    if (margin < 0 || (extraLeftColumns > 0 && checkedWidth + extraLeftColumns > paperMm * columnsPerMm + 1.0) ||
+        (shift != 0 && checkedWidth + std::abs(shift) > 24000))
         throw std::runtime_error("The bidirectional return shift exceeds the printable width.");
     // Bidi scans use the carriage origin. Encode the right margin as blank
     // raster columns so it is part of both the forward and return passes.
@@ -187,9 +181,8 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
     if (!gdi->dc) throw std::runtime_error("Could not create the VEGA raster surface.");
     gdi->bitmap = CreateDIBSection(gdi->dc, reinterpret_cast<BITMAPINFO*>(&info), DIB_RGB_COLORS, &pixels, nullptr, 0);
     gdi->pen = CreatePen(PS_SOLID, stroke, RGB(0, 0, 0));
-    const LOGBRUSH ink{BS_SOLID, RGB(0, 0, 0), 0};
-    gdi->labelPen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_JOIN_ROUND, stroke, &ink, 0, nullptr);
-    if (!gdi->bitmap || !gdi->pen || !gdi->labelPen)
+    if (labelStroke) gdi->labelPen = CreatePen(PS_SOLID, labelStroke, RGB(0, 0, 0));
+    if (!gdi->bitmap || !gdi->pen || (labelStroke && !gdi->labelPen))
         throw std::runtime_error("Could not allocate a VEGA raster band.");
     SelectObject(gdi->dc, gdi->bitmap);
     SelectObject(gdi->dc, gdi->pen);
@@ -199,18 +192,18 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
     const size_t stride = (static_cast<size_t>(inkColumns) + 31) / 32 * 4;
     // The drawing owns the points referenced by each mark. Only one encoded band is held at a time.
     job.encodeBand = [drawing = std::move(drawing), marks = std::move(marks), gdi, pixels, stride,
-                      sx, sy, left, top, stroke, inkColumns, inkRows, scanColumns, bandCount, bidi, shift,
+                      sx, sy, labelScale, left, top, padding, inkColumns, inkRows, scanColumns, bandCount, bidi, shift,
                       firstColumn = leadingColumns + marginColumns, bandRows, heads, &stop](unsigned band) {
         if (band >= static_cast<unsigned>(bandCount)) throw std::out_of_range("VEGA band index");
         if (stop) return std::string();
-        const auto col = [&](double y) { return static_cast<LONG>(std::lround(y * sx - left + stroke / 2)); };
+        const auto col = [&](double y) { return static_cast<LONG>(std::lround(y * sx - left + padding / 2)); };
         const int start = static_cast<int>(band) * bandRows;
         const auto row = [&](double x) {
-            return static_cast<LONG>(std::lround(x * sy - top + stroke / 2) - start);
+            return static_cast<LONG>(std::lround(x * sy - top + padding / 2) - start);
         };
         ZeroMemory(pixels, stride * bandRows);
         for (const auto& mark : marks) {
-            if (mark.y1 - top + stroke < start || mark.y0 - top - stroke >= start + bandRows) continue;
+            if (mark.y1 - top + padding < start || mark.y0 - top - padding >= start + bandRows) continue;
             const auto& item = *mark.item;
             if (item.type == 0) {
                 const auto a = item.pts[mark.end - 1];
@@ -223,24 +216,10 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
                              col(item.c.y + item.r) + 1, row(item.c.x + item.r) + 1))
                     throw std::runtime_error("Could not rasterize a circle.");
             } else {
-                const int angle = static_cast<int>(std::lround(std::atan2(-item.dx * sy, item.dy * sx) *
-                                                              1800 / 3.14159265358979323846));
-                HFONT font = plotFont(item, sy, angle);
-                if (!font) throw std::runtime_error("Could not create a font for a plot label.");
-                const HGDIOBJ oldFont = SelectObject(gdi->dc, font);
-                const HGDIOBJ oldPen = SelectObject(gdi->dc, gdi->labelPen);
-                const HGDIOBJ oldBrush = SelectObject(gdi->dc, GetStockObject(BLACK_BRUSH));
-                // TextOut adds TrueType glyph outlines to the path. Use the drawing's stroke and fill the glyphs.
-                const BOOL ok = BeginPath(gdi->dc) &&
-                    TextOutA(gdi->dc, col(item.c.y), row(item.c.x), item.text.c_str(),
-                             static_cast<int>(item.text.size())) &&
-                    EndPath(gdi->dc) && StrokeAndFillPath(gdi->dc);
-                if (!ok) AbortPath(gdi->dc);
-                SelectObject(gdi->dc, oldBrush);
-                SelectObject(gdi->dc, oldPen);
-                SelectObject(gdi->dc, oldFont);
-                DeleteObject(font);
-                if (!ok) throw std::runtime_error("Could not rasterize a plot label.");
+                const double height = std::clamp(std::abs(item.height) * sy * labelScale, 1.0, 4096.0);
+                const double angle = std::atan2(item.dx * sy, item.dy * sx);
+                if (!drawPlotText(gdi->dc, col(item.c.y), row(item.c.x), item.text, height, angle, gdi->labelPen))
+                    throw std::runtime_error("Could not rasterize a plot label.");
             }
         }
         GdiFlush();

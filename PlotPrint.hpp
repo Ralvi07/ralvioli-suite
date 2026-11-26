@@ -1,12 +1,14 @@
 #pragma once
 
 #include "PlotStream.hpp"
+#include "PlotText.hpp"
 #include <atomic>
 
 // The monochrome bitmap stays in memory. The Windows printer driver receives it at physical size.
 inline bool printPlot(const rm::Piece& piece, const rp::Stream& stream, const rp::Plan& plan,
                             cal::Factors calibration, double paperUnits, int dpi, double lineWidthMm,
-                            HDC printer, const std::wstring& title, const std::atomic_bool& stop, std::string& error) {
+                            HDC printer, const std::wstring& title, const std::atomic_bool& stop, std::string& error,
+                            double textWidthMm = 0, double labelScale = 1) {
     if (stop) return false;
     const auto drawing = rp::buildDrawing(piece, stream);
     const auto selected = [&](int line) {
@@ -17,6 +19,9 @@ inline bool printPlot(const rm::Piece& piece, const rp::Stream& stream, const rp
     const double feed = calibration.feed * scale;
     const int penWidth = std::max(1, static_cast<int>(std::lround(lineWidthMm * dpi / 25.4)));
     const double columns = std::ceil(paperUnits * scale - 1e-9);
+    const int textPixels = std::max(1, static_cast<int>(std::lround(plotTextWidth(lineWidthMm, textWidthMm) * dpi / 25.4)));
+    const bool printText = labelScale > 0 && plotTextWidth(lineWidthMm, textWidthMm) > 0;
+    bool hasTextStroke = false;
     double first = 0, last = 0;
     bool drawable = false;
     const auto include = [&](double start, double end) {
@@ -32,9 +37,10 @@ inline bool printPlot(const rm::Piece& piece, const rp::Stream& stream, const rp
                             std::max(item.pts[i - 1].x, item.pts[i].x));
                 }
             }
-        } else if (selected(item.line)) {
+        } else if (selected(item.line) && (item.type == 1 || (printText && !item.text.empty()))) {
+            hasTextStroke |= item.type == 2;
             const double margin = item.type == 1 ? std::abs(item.r) :
-                std::abs(item.height) * (static_cast<double>(item.text.size()) + 1.0);
+                std::abs(item.height) * labelScale * (static_cast<double>(item.text.size()) + 1.0);
             include(item.c.x - margin, item.c.x + margin);
         }
     }
@@ -43,7 +49,7 @@ inline bool printPlot(const rm::Piece& piece, const rp::Stream& stream, const rp
         return false;
     }
     const double origin = plan.lineIn.front() ? -stream.dx : first;
-    const double rows = std::ceil((last - origin) * feed - 1e-9) + penWidth + 1;
+    const double rows = std::ceil((last - origin) * feed - 1e-9) + std::max(penWidth, hasTextStroke ? textPixels : 0) + 1;
     if (!(columns >= 1 && columns <= 100000 && rows >= 1 && rows <= 1000000)) {
         error = "Raster dimensions exceed the export limits.";
         return false;
@@ -79,7 +85,8 @@ inline bool printPlot(const rm::Piece& piece, const rp::Stream& stream, const rp
     HDC dc = CreateCompatibleDC(nullptr);
     HBITMAP bitmap = CreateDIBSection(dc, reinterpret_cast<BITMAPINFO*>(&info), DIB_RGB_COLORS, &pixels, nullptr, 0);
     HPEN pen = CreatePen(PS_SOLID, penWidth, RGB(0, 0, 0));
-    bool ok = dc && bitmap && pen;
+    HPEN textPen = hasTextStroke ? CreatePen(PS_SOLID, textPixels, RGB(0, 0, 0)) : nullptr;
+    bool ok = dc && bitmap && pen && (!hasTextStroke || textPen);
     if (ok) {
         SelectObject(dc, bitmap);
         SelectObject(dc, pen);
@@ -105,22 +112,11 @@ inline bool printPlot(const rm::Piece& piece, const rp::Stream& stream, const rp
             } else if (selected(item.line) && item.type == 1) {
                 ok = Ellipse(dc, deviceX(item.c.y - item.r), deviceY(item.c.x - item.r),
                              deviceX(item.c.y + item.r) + 1, deviceY(item.c.x + item.r) + 1) && ok;
-            } else if (selected(item.line)) {
-                const int angle = static_cast<int>(std::lround(std::atan2(-item.dx * feed, item.dy * across)
-                                                               * 1800 / 3.14159265358979323846));
-                const int size = static_cast<int>(std::clamp(std::round(std::abs(item.height) * scale), 1.0, 4096.0));
-                HFONT font = CreateFontW(-size, 0, angle, angle, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
-                                         DEFAULT_PITCH, L"Segoe UI");
-                if (font) {
-                    HGDIOBJ old = SelectObject(dc, font);
-                    ok = TextOutA(dc, deviceX(item.c.y), deviceY(item.c.x), item.text.c_str(),
-                                  static_cast<int>(item.text.size())) && ok;
-                    SelectObject(dc, old);
-                    DeleteObject(font);
-                } else {
-                    ok = false;
-                }
+            } else if (textPen && selected(item.line)) {
+                const double angle = std::atan2(item.dx * feed, item.dy * across);
+                const double height = std::clamp(std::abs(item.height) * labelScale * scale, 1.0, 4096.0);
+                ok = drawPlotText(dc, deviceX(item.c.y), deviceY(item.c.x), item.text,
+                                  height, angle, textPen) && ok;
             }
         }
         ok = GdiFlush() && ok;
@@ -153,5 +149,6 @@ inline bool printPlot(const rm::Piece& piece, const rp::Stream& stream, const rp
     if (dc) DeleteDC(dc);
     if (bitmap) DeleteObject(bitmap);
     if (pen) DeleteObject(pen);
+    if (textPen) DeleteObject(textPen);
     return ok;
 }

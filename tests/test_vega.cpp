@@ -111,6 +111,70 @@ int main(int argc, char** argv) {
     assert(rejected);
     std::cout << "20 m and 100 m jobs accepted. 100.001 m rejected.\n";
 
+    const auto textJob = [&](std::string name, double textWidthMm, double labelScale = 1) {
+        rm::Piece piece;
+        rm::Op move(rm::K::Pts);
+        move.verb = "PU";
+        move.pts = {{4000, 500}};
+        rm::Op label(rm::K::Label);
+        label.text = std::move(name);
+        piece.ops = {move, label};
+        const auto stream = rp::makeStream(piece, 0.025);
+        const auto plan = rp::makePlan(stream, 0, 100);
+        return vega::rasterize(piece, stream, plan, {}, 1895, 55, 10, 0.4, "Text stroke", keepGoing,
+                               false, std::nullopt, 0, {}, textWidthMm, labelScale);
+    };
+    const auto countDots = [](const vega::RasterJob& job) {
+        unsigned ink = 0;
+        for (unsigned band = 0; band < job.bandCount; ++band) {
+            const auto bytes = job.encodeBand(band);
+            for (size_t i = 0; i + 4 <= bytes.size(); i += 4)
+                ink += __builtin_popcount(word(bytes, i + 2) & 0x3fff);
+        }
+        return ink;
+    };
+    assert(countDots(textJob("QEMER.7", 2)) > countDots(textJob("QEMER.7", 0.4)));
+    const std::string fileHeader = "File: Marker 1    Modified: Sun 14 Dec 25    La.: 1140.0 mm    Lu.: 1049.7 mm";
+    assert(countDots(textJob(fileHeader, 2)) > countDots(textJob(fileHeader, 0)));
+    assert(countDots(textJob(fileHeader, 0)) > countDots(textJob(fileHeader, -0.2)));
+    assert(countDots(textJob("SELANIK", 0, 1.5)) > countDots(textJob("SELANIK", 0)));
+    assert(countDots(textJob("SELANIK", 0)) > countDots(textJob("SELANIK", 0, 0.5)));
+    assert(plotTextWidth(0.4, -0.4) == 0);
+    bool textOmitted = false;
+    try { textJob("SELANIK", -0.4); }
+    catch (const std::runtime_error& error) {
+        textOmitted = std::string(error.what()).find("no drawing") != std::string::npos;
+    }
+    assert(textOmitted);
+    textOmitted = false;
+    try { textJob(fileHeader, 0, 0); }
+    catch (const std::runtime_error& error) {
+        textOmitted = std::string(error.what()).find("no drawing") != std::string::npos;
+    }
+    assert(textOmitted);
+
+    HDC display = GetDC(nullptr);
+    HDC canvas = CreateCompatibleDC(display);
+    HBITMAP bitmap = CreateCompatibleBitmap(display, 32, 32);
+    ReleaseDC(nullptr, display);
+    HPEN strokePen = CreatePen(PS_SOLID, 5, RGB(0, 0, 0));
+    assert(canvas && bitmap && strokePen);
+    const HGDIOBJ originalBitmap = SelectObject(canvas, bitmap);
+    assert(PatBlt(canvas, 0, 0, 32, 32, WHITENESS));
+    assert(drawPlotText(canvas, 12, 22, "I", 12, 0, strokePen));
+    const HGDIOBJ originalPen = SelectObject(canvas, strokePen);
+    const POINT reference[]{{24, 10}, {24, 22}};
+    assert(Polyline(canvas, reference, 2));
+    for (int y = 5; y < 28; ++y)
+        for (int x = 11; x <= 21; ++x)
+            assert(GetPixel(canvas, x, y) == GetPixel(canvas, x + 8, y));
+    SelectObject(canvas, originalPen);
+    SelectObject(canvas, originalBitmap);
+    DeleteObject(strokePen);
+    DeleteObject(bitmap);
+    DeleteDC(canvas);
+    std::cout << "Text offsets, label scaling, Off, and matching capital-I and line strokes verified.\n";
+
     if (argc < 2) return 0;
     if (argc == 3) {
         rm::Cache cache;
