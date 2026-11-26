@@ -27,6 +27,6 @@ Drag with the middle mouse button at any zoom level. When zoomed in, hover over 
 
 Direct VEGA printing uses the libusbK driver for USB device `135D:F001`. Suite Setup installs the x64 `libusbK.dll` with Plotter. Select **Install the Algotex VEGA USB driver** during setup to run the bundled driver wizard. For a portable build, use the DLL in `drivers/Algotex_USB_Plotter` next to the Plotter executable.
 
-Use **Connect** before printing. **Print auto** previews the queue in print order and prints it one file at a time. **Configuration** contains paper settings, print direction, calibration, history, and test patterns. **Shift(mm)** adjusts the return pass in bidirectional printing. Calibration rectangles can also be submitted through a Windows printer queue.
+Use **Connect** before printing. **Print auto** previews the queue in print order and prints it one file at a time. **Configuration** contains paper settings, print direction, calibration, history, and test patterns. **Shift(mm)** adjusts the return pass in bidirectional printing. Calibration rectangles can also be printed.
 
 Plotter settings default to `%LOCALAPPDATA%\Ralvioli Suite\Ralvioli Plotter.ini`. For a portable build, place the sample `RalvioliPlotter.ini` next to the executable as `Ralvioli Plotter.ini`.
