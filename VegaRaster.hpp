@@ -21,6 +21,28 @@ inline constexpr int nozzleBankOffset = 39;
 inline constexpr int minScanColumns = 8330;
 inline constexpr int scanOverrunColumns = 801;
 inline constexpr unsigned packetSize = 1024;
+inline constexpr int headSlots = 4;
+inline constexpr unsigned feedTicksPerHead = 192;
+
+struct HeadLayout {
+    unsigned mask = 1;
+    std::array<double, headSlots> offsetMm{0, 26.75, 53.70, 80.65};
+
+    bool enabled(unsigned slot) const { return (mask & (1u << slot)) != 0; }
+
+    int count() const {
+        int active = 0;
+        for (unsigned slot = 0; slot < headSlots; ++slot) active += enabled(slot);
+        return active;
+    }
+
+    int bandRows() const { return rowsPerBand * count(); }
+    unsigned bandFeed() const { return feedTicksPerHead * count(); }
+
+    int columnOffset(unsigned slot) const {
+        return static_cast<int>(std::lround(offsetMm[slot] * columnsPerMm));
+    }
+};
 
 inline void appendLE16(std::string& bytes, unsigned value) {
     bytes.push_back(static_cast<char>(value & 255));
@@ -33,17 +55,17 @@ inline void appendBE32(std::string& bytes, unsigned value) {
 }
 
 class Band {
-    std::vector<std::array<uint16_t, 22>> columns;
+    std::vector<std::array<uint16_t, 22 * headSlots>> columns;
 public:
     explicit Band(int width) : columns(static_cast<size_t>(width)) {}
 
-    void dot(int x, int row) {
-        if (x < 0 || row < 0 || row >= rowsPerBand) return;
+    void dot(int x, int row, unsigned head = 0) {
+        if (x < 0 || row < 0 || row >= rowsPerBand || head >= headSlots) return;
         for (int bank = 0; bank < 2; ++bank) {
             const int column = x + (bank == 0 ? nozzleBankOffset : 0);
             if (static_cast<size_t>(column) >= columns.size()) continue;
             const unsigned slot = nozzleForRow[row * 2 + bank];
-            columns[column][slot >> 4] |= static_cast<uint16_t>(1u << (slot & 15));
+            columns[column][(slot >> 4) * headSlots + head] |= static_cast<uint16_t>(1u << (slot & 15));
         }
     }
 
@@ -53,10 +75,10 @@ public:
         // Reverse the entire carriage scan, including margins and the offset between nozzle banks.
         for (size_t i = 0; i < columns.size(); ++i) {
             const auto& masks = columns[reverseColumns ? columns.size() - i - 1 : i];
-            for (unsigned phase = 21; phase > 0; --phase) {
-                if (!masks[phase]) continue;
-                appendLE16(bytes, phase * 4);
-                appendLE16(bytes, masks[phase]);
+            for (size_t tag = masks.size() - 1; tag > 0; --tag) {
+                if (!masks[tag]) continue;
+                appendLE16(bytes, static_cast<unsigned>(tag));
+                appendLE16(bytes, masks[tag]);
             }
             appendLE16(bytes, 0xC000);
             appendLE16(bytes, 0xC000 | masks[0]);
@@ -83,14 +105,14 @@ inline std::string capturedSquareRecord(std::string_view frame, double spacingMm
 }
 
 inline std::string jobRecord(std::string title, unsigned bands, unsigned columns, double rightMarginMm,
-                             unsigned finalAdvance, bool bidi = false) {
+                             unsigned finalAdvance, bool bidi = false, unsigned bandFeed = feedTicksPerHead) {
     title.resize(32, '\0');
     std::string data = std::move(title);
     data += proto::be16(bidi ? 1 : 0);
     appendBE32(data, static_cast<unsigned>(std::floor(rightMarginMm * feedTicksPerMm)));
     appendBE32(data, bands);
     appendBE32(data, columns);
-    data += proto::be16(0x00C0);  // Standard band feed for this VEGA profile
+    data += proto::be16(bandFeed);
     data += proto::be16(finalAdvance);
     data += proto::be16(0x0160);  // Uncompressed column record size
     data += proto::be16(0);       // Channel

@@ -301,9 +301,9 @@ inline std::vector<Token> scan(const std::string& data) {
 }
 
 // Interpret commands using the selected input step size and collect the drawing operations.
-inline Parsed parse(const std::string& path, double unitMm = 0.025) {
+inline Parsed parseContents(const std::string& path, const std::string& contents, double unitMm) {
     const double f = unitMm / 0.025;
-    std::string raw = stripEsc(readFile(path));
+    std::string raw = stripEsc(contents);
     std::vector<Token> tokens = scan(raw);
 
     size_t headerEnd = raw.size();
@@ -487,6 +487,10 @@ inline Parsed parse(const std::string& path, double unitMm = 0.025) {
         }
     }
     return out;
+}
+
+inline Parsed parse(const std::string& path, double unitMm = 0.025) {
+    return parseContents(path, readFile(path), unitMm);
 }
 
 inline Pt rot(const Pt& p, const Pt& pivot, double c, double s) {

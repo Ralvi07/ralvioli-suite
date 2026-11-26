@@ -56,6 +56,8 @@ struct Slot {
     int extra;
 };
 
+enum class CropGuide { Left, Right, Bottom, Top };
+
 struct State {
     HINSTANCE inst = nullptr;
     HWND hwnd = nullptr;
@@ -82,6 +84,7 @@ struct State {
     bool cropMode = false;
     bool dragging = false;
     bool hasCrop = false;
+    std::optional<CropGuide> activeGuide;
     rm::Pt cropA;
     rm::Pt cropB;
     bool autoFit = true;
@@ -90,8 +93,9 @@ struct State {
     double vs = 1.0;
     int cw = 0;
     int ch = 0;
-    UINT panButton = 0;
+    bool panning = false;
     POINT panLast{0, 0};
+    std::optional<POINT> hover;
     std::wstring lastDir;
 };
 
@@ -174,12 +178,18 @@ void updateButtons() {
 void refreshShapes() {
     S.shapes = rm::renderLayer(S.doc);
     S.box = rm::boxOf(S.doc.ops);
+    if (S.cropMode && S.box) {
+        S.cropA = {S.box->x0, S.box->y0};
+        S.cropB = {S.box->x1, S.box->y1};
+    }
     InvalidateRect(S.preview, nullptr, FALSE);
     updateButtons();
 }
 
 bool fitView(bool apply = true) {
-    if (!S.box) return false;
+    if (!S.box) {
+        return false;
+    }
     double minx = S.box->x0;
     double miny = S.box->y0;
     double maxx = S.box->x1;
@@ -353,6 +363,11 @@ void setCropMode(bool on) {
     S.cropMode = on;
     S.hasCrop = false;
     S.dragging = false;
+    S.activeGuide.reset();
+    if (on && S.box) {
+        S.cropA = {S.box->x0, S.box->y0};
+        S.cropB = {S.box->x1, S.box->y1};
+    }
     updateButtons();
     InvalidateRect(S.preview, nullptr, FALSE);
 }
@@ -471,15 +486,36 @@ void unitsOutChanged() {
     }
 }
 
-void startPan(int x, int y, UINT releaseButton) {
+void startPan(int x, int y) {
     ensureView();
-    if (!S.has || S.dragging || S.panButton) return;
-    // Middle-button panning works at every zoom level and preserves edit mode.
+    if (!S.has || S.dragging || S.activeGuide || S.panning) {
+        return;
+    }
     S.autoFit = false;
-    S.panButton = releaseButton;
-    KillTimer(S.preview, preview::hoverTimer);
+    S.panning = true;
     S.panLast = POINT{x, y};
     SetCapture(S.preview);
+}
+
+std::optional<CropGuide> cropGuideAt(int x, int y) {
+    if (!S.cropMode || !S.box) {
+        return std::nullopt;
+    }
+    const auto [paperX, paperY] = toPaper(x, y);
+    std::optional<CropGuide> closest;
+    double distance = dp(7);
+    auto consider = [&](CropGuide guide, double offset) {
+        const double pixels = std::abs(offset) * S.vs;
+        if (pixels < distance) {
+            closest = guide;
+            distance = pixels;
+        }
+    };
+    consider(CropGuide::Left, paperX - S.cropA.x);
+    consider(CropGuide::Right, paperX - S.cropB.x);
+    consider(CropGuide::Bottom, paperY - S.cropA.y);
+    consider(CropGuide::Top, paperY - S.cropB.y);
+    return closest;
 }
 
 void onLeftDown(int x, int y) {
@@ -488,6 +524,11 @@ void onLeftDown(int x, int y) {
         return;
     }
     if (S.cropMode) {
+        S.activeGuide = cropGuideAt(x, y);
+        if (S.activeGuide) {
+            SetCapture(S.preview);
+            return;
+        }
         std::pair<double, double> p = toPaper(x, y);
         S.cropA = rm::Pt{p.first, p.second};
         S.cropB = S.cropA;
@@ -498,33 +539,51 @@ void onLeftDown(int x, int y) {
         updateButtons();
         return;
     }
-    startPan(x, y, WM_LBUTTONUP);
+    startPan(x, y);
 }
 
 void onMove(int x, int y) {
-    if (S.panButton) {
+    if (S.panning) {
         S.vx -= (x - S.panLast.x) / S.vs;
         S.vy += (y - S.panLast.y) / S.vs;
         S.panLast = POINT{x, y};
-        InvalidateRect(S.preview, nullptr, FALSE);
-        return;
-    }
-    if (S.dragging) {
+    } else if (S.activeGuide) {
+        const auto [paperX, paperY] = toPaper(x, y);
+        const double gap = 1.0 / S.vs;
+        switch (*S.activeGuide) {
+            case CropGuide::Left: S.cropA.x = std::min(paperX, S.cropB.x - gap); break;
+            case CropGuide::Right: S.cropB.x = std::max(paperX, S.cropA.x + gap); break;
+            case CropGuide::Bottom: S.cropA.y = std::min(paperY, S.cropB.y - gap); break;
+            case CropGuide::Top: S.cropB.y = std::max(paperY, S.cropA.y + gap); break;
+        }
+        S.hasCrop = true;
+        updateButtons();
+    } else if (S.dragging) {
         std::pair<double, double> p = toPaper(x, y);
         S.cropB = rm::Pt{p.first, p.second};
-        InvalidateRect(S.preview, nullptr, FALSE);
     }
 }
 
 void onLeftUp() {
-    if (S.panButton) {
-        S.panButton = 0;
+    if (S.activeGuide) {
+        S.activeGuide.reset();
+        ReleaseCapture();
+    }
+    if (S.panning) {
+        S.panning = false;
         ReleaseCapture();
     }
     if (S.dragging) {
         S.dragging = false;
         ReleaseCapture();
         S.hasCrop = std::fabs(S.cropB.x - S.cropA.x) * S.vs > 4 && std::fabs(S.cropB.y - S.cropA.y) * S.vs > 4;
+        if (S.hasCrop) {
+            if (S.cropA.x > S.cropB.x) std::swap(S.cropA.x, S.cropB.x);
+            if (S.cropA.y > S.cropB.y) std::swap(S.cropA.y, S.cropB.y);
+        } else if (S.box) {
+            S.cropA = {S.box->x0, S.box->y0};
+            S.cropB = {S.box->x1, S.box->y1};
+        }
         updateButtons();
         InvalidateRect(S.preview, nullptr, FALSE);
     }
@@ -583,7 +642,7 @@ void drawScene(HDC dc, int, int h) {
         DeleteObject(f.second);
     }
 
-    if (S.cropMode && (S.dragging || S.hasCrop)) {
+    if (S.cropMode && S.box) {
         int x0 = X(std::min(S.cropA.x, S.cropB.x));
         int x1 = X(std::max(S.cropA.x, S.cropB.x));
         int y0 = Y(std::max(S.cropA.y, S.cropB.y));
@@ -591,7 +650,36 @@ void drawScene(HDC dc, int, int h) {
         HPEN dash = CreatePen(PS_DASH, 1, RGB(0xc6, 0x28, 0x28));
         HGDIOBJ op = SelectObject(dc, dash);
         HGDIOBJ ob = SelectObject(dc, nullBrush);
-        Rectangle(dc, x0, y0, x1, y1);
+        if (S.dragging) {
+            Rectangle(dc, x0, y0, x1, y1);
+        } else {
+            const int arrow = dp(5);
+            const int handle = dp(16);
+            auto drawLine = [&](int ax, int ay, int bx, int by) {
+                MoveToEx(dc, ax, ay, nullptr);
+                LineTo(dc, bx, by);
+            };
+            for (int x : {x0, x1}) {
+                drawLine(x, 0, x, h);
+                drawLine(x - arrow, handle, x + arrow, handle);
+                POINT left[]{{x - arrow / 2, handle - arrow / 2}, {x - arrow, handle},
+                             {x - arrow / 2, handle + arrow / 2}};
+                POINT right[]{{x + arrow / 2, handle - arrow / 2}, {x + arrow, handle},
+                              {x + arrow / 2, handle + arrow / 2}};
+                Polyline(dc, left, ARRAYSIZE(left));
+                Polyline(dc, right, ARRAYSIZE(right));
+            }
+            for (int y : {y0, y1}) {
+                drawLine(0, y, S.cw, y);
+                drawLine(handle, y - arrow, handle, y + arrow);
+                POINT top[]{{handle - arrow / 2, y - arrow / 2}, {handle, y - arrow},
+                            {handle + arrow / 2, y - arrow / 2}};
+                POINT bottom[]{{handle - arrow / 2, y + arrow / 2}, {handle, y + arrow},
+                               {handle + arrow / 2, y + arrow / 2}};
+                Polyline(dc, top, ARRAYSIZE(top));
+                Polyline(dc, bottom, ARRAYSIZE(bottom));
+            }
+        }
         SelectObject(dc, ob);
         SelectObject(dc, op);
         DeleteObject(dash);
@@ -611,8 +699,52 @@ bool previewZoomed() {
 }
 
 int hitPreviewArrow(POINT mouse) {
-    if (S.panButton || S.dragging || !previewZoomed()) return -1;
+    if (S.panning || S.dragging || S.activeGuide || !previewZoomed()) {
+        return -1;
+    }
     return preview::hitArrow(mouse, S.cw, S.ch, dp);
+}
+
+void drawMeasurements(HDC dc, int w, int h) {
+    if (!S.has || !S.box) {
+        return;
+    }
+    const rm::Box& box = *S.box;
+    const int padding = dp(4);
+    const int margin = dp(8);
+    SelectObject(dc, S.font);
+    SetTextAlign(dc, TA_TOP | TA_LEFT);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, GetSysColor(COLOR_INFOTEXT));
+
+    auto drawLabel = [&](const wchar_t* text, int x, int y, bool above) {
+        const int count = static_cast<int>(wcslen(text));
+        SIZE size{};
+        GetTextExtentPoint32W(dc, text, count, &size);
+        const int width = size.cx + 2 * padding;
+        const int height = size.cy + 2 * padding;
+        x = std::clamp(x, 0, std::max(0, w - width));
+        y = std::clamp(above ? y - height : y, 0, std::max(0, h - height));
+        RECT background{x, y, x + width, y + height};
+        FillRect(dc, &background, GetSysColorBrush(COLOR_INFOBK));
+        TextOutW(dc, x + padding, y + padding, text, count);
+    };
+
+    wchar_t label[96];
+    if (S.hover && hitPreviewArrow(*S.hover) < 0) {
+        const POINT p = *S.hover;
+        const auto [x, y] = toPaper(p.x, p.y);
+        if (p.x >= 0 && p.x < w && p.y >= 0 && p.y < h &&
+            x >= box.x0 && x <= box.x1 && y >= box.y0 && y <= box.y1) {
+            swprintf(label, 96, L"Length %.2f cm   Width %.2f cm",
+                     (x - box.x0) / rm::kUnitsPerCm, (y - box.y0) / rm::kUnitsPerCm);
+            drawLabel(label, p.x + dp(16), p.y - margin, p.y >= dp(36));
+        }
+    }
+
+    swprintf(label, 96, L"Length %.2f cm   Width %.2f cm",
+             (box.x1 - box.x0) / rm::kUnitsPerCm, (box.y1 - box.y0) / rm::kUnitsPerCm);
+    drawLabel(label, margin, h - margin, true);
 }
 
 LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -632,7 +764,10 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 HGDIOBJ old = SelectObject(mem, bmp);
                 FillRect(mem, &rc, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
                 drawScene(mem, w, h);
-                if (previewZoomed()) preview::drawArrows(mem, w, h, dp);
+                drawMeasurements(mem, w, h);
+                if (previewZoomed()) {
+                    preview::drawArrows(mem, w, h, dp);
+                }
                 BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
                 SelectObject(mem, old);
                 DeleteObject(bmp);
@@ -642,34 +777,50 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         case WM_LBUTTONDOWN:
-            if (S.panButton || hitPreviewArrow({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}) >= 0) return 0;
+            if (S.panning || hitPreviewArrow({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}) >= 0) {
+                return 0;
+            }
             SetFocus(hwnd);
             onLeftDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             return 0;
         case WM_MBUTTONDOWN:
             SetFocus(hwnd);
-            startPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), WM_MBUTTONUP);
+            startPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             return 0;
         case WM_LBUTTONUP:
-            if (S.panButton != WM_MBUTTONUP) onLeftUp();
-            return 0;
         case WM_MBUTTONUP:
-            if (S.panButton == msg) onLeftUp();
+            onLeftUp();
             return 0;
         case WM_CAPTURECHANGED:
-            S.panButton = 0;
+            S.panning = false;
+            S.activeGuide.reset();
             return 0;
         case WM_MOUSEMOVE: {
-            const POINT mouse{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            if (hitPreviewArrow(mouse) >= 0) SetTimer(hwnd, preview::hoverTimer, 25, nullptr);
-            else {
+            if (!S.hover) {
+                TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&tracking);
+            }
+            S.hover = POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (hitPreviewArrow(*S.hover) >= 0) {
+                SetTimer(hwnd, preview::hoverTimer, 25, nullptr);
+            } else {
                 KillTimer(hwnd, preview::hoverTimer);
-                onMove(mouse.x, mouse.y);
+                onMove(S.hover->x, S.hover->y);
+            }
+            if (S.has) {
+                InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
         }
+        case WM_MOUSELEAVE:
+            KillTimer(hwnd, preview::hoverTimer);
+            S.hover.reset();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
         case WM_TIMER: {
-            if (wParam != preview::hoverTimer) break;
+            if (wParam != preview::hoverTimer) {
+                break;
+            }
             const int arrow = preview::hoveredArrow(hwnd, hitPreviewArrow);
             if (arrow < 0) {
                 KillTimer(hwnd, preview::hoverTimer);
@@ -693,7 +844,17 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
-                LPCWSTR cursor = S.panButton ? kCursorMove : (S.cropMode ? kCursorCross : kCursorArrow);
+                LPCWSTR cursor = S.panning ? kCursorMove : (S.cropMode ? kCursorCross : kCursorArrow);
+                if (S.cropMode && !S.dragging && !S.panning) {
+                    POINT p{};
+                    GetCursorPos(&p);
+                    ScreenToClient(hwnd, &p);
+                    const auto guide = S.activeGuide ? S.activeGuide : cropGuideAt(p.x, p.y);
+                    if (guide) {
+                        cursor = (*guide == CropGuide::Left || *guide == CropGuide::Right)
+                            ? MAKEINTRESOURCEW(32644) : MAKEINTRESOURCEW(32645);
+                    }
+                }
                 SetCursor(LoadCursorW(nullptr, cursor));
                 return TRUE;
             }

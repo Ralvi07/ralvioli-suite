@@ -35,7 +35,8 @@ enum {
     ID_LIST,
     ID_STATUS,
     ID_CANCEL,
-    ID_UNITS_OUT
+    ID_UNITS_OUT,
+    ID_OPEN_PLOTTER
 };
 
 const COLORREF kColors[] = {RGB(0x15, 0x65, 0xc0), RGB(0xc6, 0x28, 0x28), RGB(0x2e, 0x7d, 0x32),
@@ -162,6 +163,8 @@ void message(const std::wstring& text, const wchar_t* title, UINT icon) {
     MessageBoxW(S.hwnd, text.c_str(), title, MB_OK | icon);
 }
 
+constexpr wchar_t kMergerSettings[] = L"Software\\Ralvioli\\Merger";
+
 std::optional<double> paperUnits() {
     wchar_t buf[64] = {0};
     GetWindowTextW(S.edit, buf, 64);
@@ -179,10 +182,18 @@ std::optional<double> paperUnits() {
     t = t.substr(a, b - a + 1);
     wchar_t* end = nullptr;
     double cm = std::wcstod(t.c_str(), &end);
-    if (end == t.c_str() || *end != L'\0' || !(cm > 0)) {
+    if (end == t.c_str() || *end != L'\0' || !(cm > 0) || !std::isfinite(cm * rm::kUnitsPerCm)) {
         return std::nullopt;
     }
     return cm * rm::kUnitsPerCm;
+}
+
+void savePaperWidth() {
+    if (!paperUnits()) return;
+    wchar_t width[64]{};
+    const int chars = GetWindowTextW(S.edit, width, ARRAYSIZE(width));
+    RegSetKeyValueW(HKEY_CURRENT_USER, kMergerSettings, L"PaperWidthCm", REG_SZ,
+                    width, (chars + 1) * sizeof(wchar_t));
 }
 
 std::vector<int> tooWide() {
@@ -295,6 +306,7 @@ void updatePreview() {
         rm::warnings().clear();
     }
     InvalidateRect(S.preview, nullptr, FALSE);
+    InvalidateRect(S.list, nullptr, FALSE);
     showStatus();
 }
 
@@ -808,9 +820,9 @@ void turnSelected(double delta) {
     updatePreview();
 }
 
-void saveFile() {
+std::optional<double> validateExport() {
     if (S.layers.empty()) {
-        return;
+        return std::nullopt;
     }
     if (S.holding >= 0) {
         dropPiece();
@@ -819,7 +831,7 @@ void saveFile() {
     if (!width) {
         message(L"Type the paper width in cm first.", L"Paper width needed", MB_ICONINFORMATION);
         SetFocus(S.edit);
-        return;
+        return std::nullopt;
     }
     std::vector<int> bad = tooWide();
     if (!bad.empty()) {
@@ -832,9 +844,68 @@ void saveFile() {
         }
         message(L"Piece " + list + L" goes past the paper width. Move or turn it first.", L"Outside the paper",
                 MB_ICONERROR);
-        return;
+        return std::nullopt;
     }
 
+    return width;
+}
+
+std::optional<std::string> mergeForExport(double width) {
+    rm::warnings().clear();
+    try {
+        return rm::merge(rm::placeLayers(S.cache, requests(), width), false, kUnitMm[S.outIdx]);
+    } catch (const std::exception& e) {
+        message(wide(e.what()), L"Could not merge", MB_ICONERROR);
+        return std::nullopt;
+    }
+}
+
+bool writeExport(const std::wstring& out, const std::string& text) {
+    FILE* f = _wfopen(out.c_str(), L"wb");
+    if (!f) return false;
+    const size_t written = fwrite(text.data(), 1, text.size(), f);
+    return fclose(f) == 0 && written == text.size();
+}
+
+void openAtPlotter() {
+    const auto width = validateExport();
+    if (!width) return;
+    const auto text = mergeForExport(*width);
+    if (!text) return;
+
+    wchar_t module[32768]{};
+    const DWORD moduleSize = GetModuleFileNameW(nullptr, module, ARRAYSIZE(module));
+    wchar_t temp[MAX_PATH + 1]{};
+    const DWORD tempSize = GetTempPathW(ARRAYSIZE(temp), temp);
+    if (!moduleSize || moduleSize >= ARRAYSIZE(module) || !tempSize || tempSize >= ARRAYSIZE(temp)) {
+        message(L"Could not locate Plotter or the temporary folder.", L"Open at Ralvioli Plotter", MB_ICONERROR);
+        return;
+    }
+    const std::wstring executable(module, moduleSize);
+    const std::wstring folder = executable.substr(0, executable.find_last_of(L'\\'));
+    const std::wstring plotter = folder + L"\\Ralvioli Plotter.exe";
+
+    // Each Plotter queue owns a different backing file, even though the display names match.
+    const std::wstring exportDir = std::wstring(temp) + L"RalvioliMerger-" +
+        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    const std::wstring out = exportDir + L"\\Ralvioli Merger Export.plt";
+    if (!CreateDirectoryW(exportDir.c_str(), nullptr)) {
+        message(L"Could not create a folder for the merged file.", L"Open at Ralvioli Plotter", MB_ICONERROR);
+        return;
+    }
+    if (writeExport(out, *text)) {
+        const std::wstring args = L"--merger-export " + std::to_wstring(S.outIdx) + L" \"" + out + L"\"";
+        if (reinterpret_cast<INT_PTR>(ShellExecuteW(S.hwnd, L"open", plotter.c_str(), args.c_str(),
+                                                   folder.c_str(), SW_SHOWNORMAL)) > 32) return;
+    }
+    DeleteFileW(out.c_str());
+    RemoveDirectoryW(exportDir.c_str());
+    message(L"Could not write the merged file or open Ralvioli Plotter.", L"Open at Ralvioli Plotter", MB_ICONERROR);
+}
+
+void saveFile() {
+    const auto width = validateExport();
+    if (!width) return;
     std::wstring first = baseName(S.layers[0].path);
     size_t dot = first.find_last_of(L'.');
     std::wstring stem = (dot == std::wstring::npos || dot == 0) ? first : first.substr(0, dot);
@@ -883,25 +954,9 @@ void saveFile() {
         }
     }
 
-    rm::warnings().clear();
-    std::string text;
-    try {
-        text = rm::merge(rm::placeLayers(S.cache, requests(), width), false, kUnitMm[S.outIdx]);
-    } catch (const rm::HpglError& e) {
-        message(wide(e.what()), L"Could not merge", MB_ICONERROR);
-        return;
-    } catch (const std::exception& e) {
-        message(wide(e.what()), L"Something went wrong", MB_ICONERROR);
-        return;
-    }
-    FILE* f = _wfopen(out.c_str(), L"wb");
-    if (!f) {
-        message(L"The file could not be written.", L"Something went wrong", MB_ICONERROR);
-        return;
-    }
-    size_t written = fwrite(text.data(), 1, text.size(), f);
-    fclose(f);
-    if (written != text.size()) {
+    const auto text = mergeForExport(*width);
+    if (!text) return;
+    if (!writeExport(out, *text)) {
         message(L"The file could not be written completely.", L"Something went wrong", MB_ICONERROR);
         return;
     }
@@ -1106,6 +1161,12 @@ void createControls(HWND hwnd) {
                              0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_WIDTH)), S.inst,
                              nullptr);
     SendMessageW(S.edit, WM_SETFONT, reinterpret_cast<WPARAM>(S.font), TRUE);
+    wchar_t savedWidth[64]{};
+    DWORD savedWidthBytes = sizeof(savedWidth);
+    if (RegGetValueW(HKEY_CURRENT_USER, kMergerSettings, L"PaperWidthCm", RRF_RT_REG_SZ,
+                     nullptr, savedWidth, &savedWidthBytes) == ERROR_SUCCESS) {
+        SetWindowTextW(S.edit, savedWidth);
+    }
     addSlot(S.edit, dp(70), dp(28), dp(22), false, 0);
 
     addButton(hwnd, ID_ZOOMOUT, L"\u2212", 22, dp(2), false);
@@ -1114,7 +1175,8 @@ void createControls(HWND hwnd) {
 
     addLabel(hwnd, L"Save as", dp(4));
     S.cbOut = addCombo(hwnd, ID_UNITS_OUT, dp(8), true);
-    addButton(hwnd, ID_SAVE, L"Save merged file...", 30, 0, true);
+    addButton(hwnd, ID_SAVE, L"Save merged file...", 30, dp(8), true);
+    addButton(hwnd, ID_OPEN_PLOTTER, L"Open at Ralvioli Plotter", 28, 0, false);
 
     int largest = 0;
     groupExtents(largest);
@@ -1174,7 +1236,7 @@ void layoutAll(int w, int h) {
         MoveWindow(s.hwnd, pos[k].first, y, s.width, s.height + s.extra, TRUE);
     }
     int bodyTop = dp(10);
-    int listW = dp(300);
+    int listW = dp(365);
     int bodyH = std::max(barTop - dp(6) - bodyTop, dp(50));
     int statusH = dp(44);
     MoveWindow(S.list, dp(10), bodyTop, listW, std::max(bodyH - statusH - dp(6), dp(40)), TRUE);
@@ -1253,6 +1315,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 drawChip(di->hDC, headerChipRect(di->rcItem), noHeader ? L"Header: off" : L"Header: on", sel, false,
                          noHeader ? RGB(0xc6, 0x28, 0x28) : RGB(0x20, 0x20, 0x20));
                 drawChip(di->hDC, unitChipRect(di->rcItem), kUnitShort[unit], sel, true, RGB(0x20, 0x20, 0x20));
+                if (di->itemID < S.boxes.size() && S.boxes[di->itemID]) {
+                    const auto& box = *S.boxes[di->itemID];
+                    wchar_t size[80]{};
+                    swprintf(size, ARRAYSIZE(size), L"%.2f \u00d7 %.2f cm",
+                             (box.x1 - box.x0) / rm::kUnitsPerCm,
+                             (box.y1 - box.y0) / rm::kUnitsPerCm);
+                    RECT dimensions = unitChipRect(di->rcItem);
+                    dimensions.left = dimensions.right + dp(8);
+                    dimensions.right = di->rcItem.right - dp(6);
+                    DrawTextW(di->hDC, size, -1, &dimensions,
+                              DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                }
                 SelectObject(di->hDC, old);
                 return TRUE;
             }
@@ -1292,6 +1366,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_SAVE:
                     saveFile();
                     break;
+                case ID_OPEN_PLOTTER:
+                    openAtPlotter();
+                    break;
                 case ID_CANCEL:
                     cancelHold();
                     break;
@@ -1299,6 +1376,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (HIWORD(wParam) == EN_CHANGE && S.preview) {
                         updatePreview();
                     }
+                    if (HIWORD(wParam) == EN_KILLFOCUS) savePaperWidth();
                     break;
                 case ID_UNITS_OUT:
                     if (HIWORD(wParam) == CBN_SELCHANGE) {
@@ -1309,6 +1387,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     break;
             }
             return 0;
+        case WM_CLOSE:
+            savePaperWidth();
+            break;
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;

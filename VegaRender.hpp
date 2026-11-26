@@ -12,10 +12,12 @@ struct RasterSurface {
     HDC dc = CreateCompatibleDC(nullptr);
     HBITMAP bitmap = nullptr;
     HPEN pen = nullptr;
+    HPEN labelPen = nullptr;
     ~RasterSurface() {
         if (dc) DeleteDC(dc);
         if (bitmap) DeleteObject(bitmap);
         if (pen) DeleteObject(pen);
+        if (labelPen) DeleteObject(labelPen);
     }
 };
 
@@ -31,11 +33,12 @@ struct FeedRange {
     double last;
 };
 
-inline FeedRange feedRange(const rm::Box& box, double feedCalibration, double from, double to) {
+inline FeedRange feedRange(const rm::Box& box, double feedCalibration, double from, double to,
+                           int bandRows = rowsPerBand) {
     const double rowsPerUnit = 0.025 * feedCalibration * rowsPerMm;
     const double length = (box.x1 - box.x0) * rowsPerUnit;
     const auto boundary = [&](double pct) {
-        return std::clamp(std::round(length * pct / (100 * rowsPerBand)) * rowsPerBand, 0.0, length);
+        return std::clamp(std::round(length * pct / (100 * bandRows)) * bandRows, 0.0, length);
     };
     return {box.x0 + (from <= 0 ? 0 : boundary(from)) / rowsPerUnit,
             box.x0 + (to >= 100 ? length : boundary(to)) / rowsPerUnit};
@@ -51,7 +54,19 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
                            cal::Factors calibration, double paperMm, double rightMarginMm,
                            double spacingMm, double lineMm,
                            const std::string& title, const std::atomic_bool& stop, bool bidi = false,
-                           std::optional<FeedRange> range = std::nullopt, int returnShiftMm = 0) {
+                           std::optional<FeedRange> range = std::nullopt, double returnShiftMm = 0,
+                           HeadLayout heads = {}) {
+    const int bandRows = heads.bandRows();
+    if (!bandRows || heads.mask >= (1u << headSlots)) throw std::runtime_error("Select at least one VEGA print head.");
+    int firstHeadColumn = 0;
+    int lastHeadColumn = 0;
+    for (unsigned slot = 0; slot < headSlots; ++slot) {
+        if (!heads.enabled(slot)) continue;
+        if (!std::isfinite(heads.offsetMm[slot]) || std::abs(heads.offsetMm[slot]) > 327.67)
+            throw std::runtime_error("Invalid VEGA head offset.");
+        firstHeadColumn = std::min(firstHeadColumn, heads.columnOffset(slot));
+        lastHeadColumn = std::max(lastHeadColumn, heads.columnOffset(slot));
+    }
     auto drawing = rp::buildDrawing(piece, stream);
     const auto selected = [&](int line) {
         return line >= 0 && static_cast<size_t>(line) < plan.lineIn.size() && plan.lineIn[line];
@@ -136,23 +151,27 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
 
     const int inkColumns = static_cast<int>(std::ceil(width)) + stroke + 1;
     const int inkRows = static_cast<int>(std::ceil(length - 1e-7)) + (range ? 0 : stroke + 1);
-    const int bandCount = (inkRows + rowsPerBand - 1) / rowsPerBand;
+    const int bandCount = (inkRows + bandRows - 1) / bandRows;
     // Columns increase away from the configured right margin. Add room on
     // the right before reversing the return band's column order.
     const int shift = bidi && bandCount > 1
         ? static_cast<int>(std::lround(-returnShiftMm * columnsPerMm)) : 0;
-    const int leadingColumns = std::max(0, -shift);
+    const int leadingColumns = std::max(0, -shift) - firstHeadColumn;
     const double margin = rightMarginMm - leadingColumns / columnsPerMm;
     const int extraLeftColumns = std::max(0, shift);
     if (margin < 0 || (extraLeftColumns > 0 && width + extraLeftColumns > paperMm * columnsPerMm + 1.0) ||
         (shift != 0 && width + std::abs(shift) > 24000))
         throw std::runtime_error("The bidirectional return shift exceeds the printable width.");
-    const int scanColumns = std::max(minScanColumns, inkColumns + std::abs(shift) + scanOverrunColumns);
-    const int lastRows = inkRows - (bandCount - 1) * rowsPerBand;
-    const unsigned advance = finalBandAdvance(lastRows * (192.0 / rowsPerBand), spacingMm);
+    // Bidi scans use the carriage origin. Encode the right margin as blank
+    // raster columns so it is part of both the forward and return passes.
+    const int marginColumns = bidi ? static_cast<int>(std::lround(margin * columnsPerMm)) : 0;
+    const int overrun = std::max(scanOverrunColumns, lastHeadColumn + nozzleBankOffset + 3);
+    const int scanColumns = std::max(minScanColumns, marginColumns + inkColumns + std::abs(shift) - firstHeadColumn + overrun);
+    const int lastRows = inkRows - (bandCount - 1) * bandRows;
+    const unsigned advance = finalBandAdvance(lastRows * (static_cast<double>(heads.bandFeed()) / bandRows), spacingMm);
     RasterJob job;
-    job.record = jobRecord(title, bandCount, scanColumns, margin,
-                           advance, bidi);
+    job.record = jobRecord(title, bandCount, scanColumns, bidi ? 0 : margin,
+                           advance, bidi, heads.bandFeed());
     job.bandCount = static_cast<unsigned>(bandCount);
     struct {
         BITMAPINFOHEADER header{};
@@ -160,7 +179,7 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
     } info;
     info.header.biSize = sizeof(info.header);
     info.header.biWidth = inkColumns;
-    info.header.biHeight = -rowsPerBand;
+    info.header.biHeight = -bandRows;
     info.header.biPlanes = 1;
     info.header.biBitCount = 1;
     info.header.biClrUsed = 2;
@@ -168,7 +187,10 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
     if (!gdi->dc) throw std::runtime_error("Could not create the VEGA raster surface.");
     gdi->bitmap = CreateDIBSection(gdi->dc, reinterpret_cast<BITMAPINFO*>(&info), DIB_RGB_COLORS, &pixels, nullptr, 0);
     gdi->pen = CreatePen(PS_SOLID, stroke, RGB(0, 0, 0));
-    if (!gdi->bitmap || !gdi->pen) throw std::runtime_error("Could not allocate a VEGA raster band.");
+    const LOGBRUSH ink{BS_SOLID, RGB(0, 0, 0), 0};
+    gdi->labelPen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_JOIN_ROUND, stroke, &ink, 0, nullptr);
+    if (!gdi->bitmap || !gdi->pen || !gdi->labelPen)
+        throw std::runtime_error("Could not allocate a VEGA raster band.");
     SelectObject(gdi->dc, gdi->bitmap);
     SelectObject(gdi->dc, gdi->pen);
     SelectObject(gdi->dc, GetStockObject(NULL_BRUSH));
@@ -177,17 +199,18 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
     const size_t stride = (static_cast<size_t>(inkColumns) + 31) / 32 * 4;
     // The drawing owns the points referenced by each mark. Only one encoded band is held at a time.
     job.encodeBand = [drawing = std::move(drawing), marks = std::move(marks), gdi, pixels, stride,
-                      sx, sy, left, top, stroke, inkColumns, inkRows, scanColumns, bandCount, bidi, shift, leadingColumns, &stop](unsigned band) {
+                      sx, sy, left, top, stroke, inkColumns, inkRows, scanColumns, bandCount, bidi, shift,
+                      firstColumn = leadingColumns + marginColumns, bandRows, heads, &stop](unsigned band) {
         if (band >= static_cast<unsigned>(bandCount)) throw std::out_of_range("VEGA band index");
         if (stop) return std::string();
         const auto col = [&](double y) { return static_cast<LONG>(std::lround(y * sx - left + stroke / 2)); };
-        const int start = static_cast<int>(band) * rowsPerBand;
+        const int start = static_cast<int>(band) * bandRows;
         const auto row = [&](double x) {
             return static_cast<LONG>(std::lround(x * sy - top + stroke / 2) - start);
         };
-        ZeroMemory(pixels, stride * rowsPerBand);
+        ZeroMemory(pixels, stride * bandRows);
         for (const auto& mark : marks) {
-            if (mark.y1 - top + stroke < start || mark.y0 - top - stroke >= start + rowsPerBand) continue;
+            if (mark.y1 - top + stroke < start || mark.y0 - top - stroke >= start + bandRows) continue;
             const auto& item = *mark.item;
             if (item.type == 0) {
                 const auto a = item.pts[mark.end - 1];
@@ -204,26 +227,41 @@ inline RasterJob rasterize(const rm::Piece& piece, const rp::Stream& stream, con
                                                               1800 / 3.14159265358979323846));
                 HFONT font = plotFont(item, sy, angle);
                 if (!font) throw std::runtime_error("Could not create a font for a plot label.");
-                HGDIOBJ old = SelectObject(gdi->dc, font);
-                const BOOL ok = TextOutA(gdi->dc, col(item.c.y), row(item.c.x), item.text.c_str(),
-                                        static_cast<int>(item.text.size()));
-                SelectObject(gdi->dc, old);
+                const HGDIOBJ oldFont = SelectObject(gdi->dc, font);
+                const HGDIOBJ oldPen = SelectObject(gdi->dc, gdi->labelPen);
+                const HGDIOBJ oldBrush = SelectObject(gdi->dc, GetStockObject(BLACK_BRUSH));
+                // TextOut adds TrueType glyph outlines to the path. Use the drawing's stroke and fill the glyphs.
+                const BOOL ok = BeginPath(gdi->dc) &&
+                    TextOutA(gdi->dc, col(item.c.y), row(item.c.x), item.text.c_str(),
+                             static_cast<int>(item.text.size())) &&
+                    EndPath(gdi->dc) && StrokeAndFillPath(gdi->dc);
+                if (!ok) AbortPath(gdi->dc);
+                SelectObject(gdi->dc, oldBrush);
+                SelectObject(gdi->dc, oldPen);
+                SelectObject(gdi->dc, oldFont);
                 DeleteObject(font);
                 if (!ok) throw std::runtime_error("Could not rasterize a plot label.");
             }
         }
         GdiFlush();
         const bool returning = bidi && band % 2 == 1;
-        const int offset = leadingColumns + (returning ? shift : 0);
+        const int offset = firstColumn + (returning ? shift : 0);
         Band raster(scanColumns);
         const auto* bits = static_cast<const unsigned char*>(pixels);
-        for (int y = 0; y < std::min(rowsPerBand, inkRows - start); ++y) {
-            const auto* rowBits = bits + static_cast<size_t>(y) * stride;
-            for (int byte = 0; byte < (inkColumns + 7) / 8; ++byte) {
-                if (rowBits[byte] == 0) continue;
-                for (int bit = 0; bit < 8 && byte * 8 + bit < inkColumns; ++bit)
-                    if (rowBits[byte] & (0x80 >> bit)) raster.dot(offset + byte * 8 + bit, y);
+        int headStart = 0;
+        for (unsigned slot = 0; slot < headSlots; ++slot) {
+            if (!heads.enabled(slot)) continue;
+            const int headColumn = offset + heads.columnOffset(slot);
+            const int rows = std::min(rowsPerBand, inkRows - start - headStart);
+            for (int row = 0; row < rows; ++row) {
+                const auto* rowBits = bits + static_cast<size_t>(headStart + row) * stride;
+                for (int byte = 0; byte < (inkColumns + 7) / 8; ++byte) {
+                    if (rowBits[byte] == 0) continue;
+                    for (int bit = 0; bit < 8 && byte * 8 + bit < inkColumns; ++bit)
+                        if (rowBits[byte] & (0x80 >> bit)) raster.dot(headColumn + byte * 8 + bit, row, slot);
+                }
             }
+            headStart += rowsPerBand;
         }
         return raster.encode(returning);
     };

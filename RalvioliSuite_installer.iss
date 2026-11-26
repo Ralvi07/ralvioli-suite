@@ -2,7 +2,7 @@
 [Setup]
 AppId={{E2A9C4B1-7D3F-4B58-A6C2-91F0D5E8B3A7}
 AppName=Ralvioli Suite
-AppVersion=1.1.3
+AppVersion=1.1.4
 AppPublisher=Ralvioli
 DefaultDirName={autopf}\Ralvioli Suite
 DefaultGroupName=Ralvioli Suite
@@ -35,9 +35,8 @@ Name: "algotexdriver"; Description: "Install the Algotex VEGA USB driver"; Flags
 [Files]
 Source: "build\Ralvioli Merger.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: merger
 Source: "build\Ralvioli Viewer.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: viewer
-Source: "build\Ralvioli Plotter.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: plotter
-
-Source: "drivers\Algotex_USB_Plotter\libusbK.dll"; DestDir: "{app}"; Flags: ignoreversion; Components: plotter
+Source: "build\Ralvioli Plotter.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: plotter or merger
+Source: "drivers\Algotex_USB_Plotter\libusbK.dll"; DestDir: "{app}"; Flags: ignoreversion; Components: plotter or merger
 Source: "drivers\Algotex_USB_Plotter\InstallDriver.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Components: plotter; Tasks: algotexdriver
 
 [Run]
@@ -47,8 +46,8 @@ Filename: "{tmp}\InstallDriver.exe"; StatusMsg: "Installing the Algotex VEGA USB
 [Icons]
 Name: "{group}\Ralvioli Merger"; Filename: "{app}\Ralvioli Merger.exe"; Components: merger
 Name: "{group}\Ralvioli Viewer"; Filename: "{app}\Ralvioli Viewer.exe"; Components: viewer
-Name: "{group}\Ralvioli Plotter"; Filename: "{app}\Ralvioli Plotter.exe"; Components: plotter
+Name: "{group}\Ralvioli Plotter"; Filename: "{app}\Ralvioli Plotter.exe"; Components: plotter or merger
 Name: "{group}\Uninstall Ralvioli Suite"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Ralvioli Merger"; Filename: "{app}\Ralvioli Merger.exe"; Tasks: desktopicons; Components: merger
 Name: "{autodesktop}\Ralvioli Viewer"; Filename: "{app}\Ralvioli Viewer.exe"; Tasks: desktopicons; Components: viewer
-Name: "{autodesktop}\Ralvioli Plotter"; Filename: "{app}\Ralvioli Plotter.exe"; Tasks: desktopicons; Components: plotter
+Name: "{autodesktop}\Ralvioli Plotter"; Filename: "{app}\Ralvioli Plotter.exe"; Tasks: desktopicons; Components: plotter or merger
